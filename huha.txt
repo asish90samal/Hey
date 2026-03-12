@@ -1,0 +1,413 @@
+"""
+aml_screen.py  —  AML Enterprise Screener
+══════════════════════════════════════════════════════════════════════
+Screen one person, several people, or a whole CSV file.
+For EACH person you get two scores side-by-side:
+
+  WITHOUT integration  →  rule-based score only (how project was built)
+  WITH integration     →  rule + ML (GradientBoosting) + graph risk blended
+
+USAGE
+─────
+  python aml_screen.py --name "Mohammed Ali Hassan" --country IRAN --dob 1970-03-15
+  python aml_screen.py --names "Ali Hassan, Virat Kohli, John Smith" --country IRAN
+  python aml_screen.py --csv customers.csv
+  python aml_screen.py --csv customers.csv --model-report
+
+CSV FORMAT  (columns: name, dob, country, entity_type, job_type)
+═══════════════════════════════════════════════════════════════════════
+"""
+from __future__ import annotations
+import os, sys, time, argparse, textwrap
+import numpy as np, pandas as pd
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path: sys.path.insert(0, ROOT)
+
+W = 50; DIV = "│"
+def _p(s, w=W): return str(s)[:w].ljust(w)
+def _row(l, r): print(f"  {_p(l)} {DIV} {_p(r)}")
+def _div(c="─"): print(f"  {c*W} {DIV} {c*W}")
+RED="\033[91m"; YEL="\033[93m"; GRN="\033[92m"
+BOLD="\033[1m"; DIM="\033[90m"; RST="\033[0m"
+def _col(s, c): return f"{c}{s}{RST}"
+def _bar(v, w=20): n=int(round(v*w)); return "█"*n+"░"*(w-n)
+def _dec_col(d, sc):
+    c = RED if d=="ALERT" else YEL if d=="REVIEW" else GRN
+    return _col(f"{d}  (score={sc:.4f})", c)
+
+
+# ── ML Engine ─────────────────────────────────────────────────────────────────
+
+class MLEngine:
+    def __init__(self):
+        from sklearn.ensemble import GradientBoostingClassifier
+        self._clf = GradientBoostingClassifier(
+            n_estimators=120, max_depth=3, learning_rate=0.05,
+            subsample=0.8, min_samples_leaf=3, random_state=42)
+        self._trained = False; self._metrics: dict = {}; self._n_train = 0
+
+    def train(self, registry) -> "MLEngine":
+        from feature_engine.feature_builder import build_features, FEATURE_NAMES
+        from sklearn.model_selection import StratifiedKFold, cross_validate
+        from sklearn.metrics import (roc_auc_score, average_precision_score,
+                                     confusion_matrix, classification_report)
+        import random
+        rng = random.Random(7)
+        all_parts = [df for (_,et),df in registry._store.items() if et=="INDIVIDUAL"]
+        if not all_parts: return self
+        records = pd.concat(all_parts, ignore_index=True).to_dict("records")
+        pos = [r for r in records if r.get("risk_label",0)==1]
+        neg = [r for r in records if r.get("risk_label",0)==0]
+        X_rows, y_labels = [], []
+        for rec in pos:
+            row = pd.Series(rec).fillna("")
+            inp = {"name":rec["primary_name"],"dob":str(rec.get("dob","") or ""),"country":str(rec.get("nationality","") or "")}
+            mr  = {"composite_score":1.0,"score_token_sort":1.0,"score_token_set":1.0,
+                   "score_partial":0.95,"score_jaro_winkler":0.98,"matched_on_alias":False}
+            f   = build_features(match_result=mr, input_record=inp, candidate_row=row)
+            X_rows.append([f[k] for k in FEATURE_NAMES]); y_labels.append(1)
+        n_neg = max(len(pos)*4, 80)
+        for _ in range(n_neg):
+            ra = rng.choice(neg if neg else records)
+            rb = rng.choice(pos if pos else records)
+            if ra.get("entity_id")==rb.get("entity_id"): continue
+            sc = rng.uniform(0.0, 0.40)
+            row = pd.Series(ra).fillna("")
+            inp = {"name":rb["primary_name"],"dob":str(rb.get("dob","") or ""),"country":str(rb.get("nationality","") or "")}
+            mr  = {"composite_score":sc,"score_token_sort":sc*0.9,"score_token_set":sc,
+                   "score_partial":sc*0.85,"score_jaro_winkler":sc*0.95,"matched_on_alias":False}
+            f   = build_features(match_result=mr, input_record=inp, candidate_row=row)
+            X_rows.append([f[k] for k in FEATURE_NAMES]); y_labels.append(0)
+        X = np.array(X_rows, dtype=np.float32)
+        y = np.array(y_labels, dtype=np.int32)
+        self._n_train = len(y)
+        if y.sum()==0: return self
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        cv_res = cross_validate(self._clf, X, y, cv=cv,
+            scoring=["roc_auc","average_precision","f1","precision","recall"])
+        self._clf.fit(X, y)
+        self._trained = True
+        y_proba = self._clf.predict_proba(X)[:,1]
+        y_pred  = (y_proba>=0.5).astype(int)
+        cm      = confusion_matrix(y, y_pred)
+        self._metrics = {
+            "cv_roc_auc":   round(cv_res["test_roc_auc"].mean(),4),
+            "cv_roc_std":   round(cv_res["test_roc_auc"].std(),4),
+            "cv_pr_auc":    round(cv_res["test_average_precision"].mean(),4),
+            "cv_f1":        round(cv_res["test_f1"].mean(),4),
+            "cv_precision": round(cv_res["test_precision"].mean(),4),
+            "cv_recall":    round(cv_res["test_recall"].mean(),4),
+            "tr_roc_auc":   round(roc_auc_score(y, y_proba),4),
+            "tr_pr_auc":    round(average_precision_score(y, y_proba),4),
+            "cm": cm.tolist(),
+            "clf_report":   classification_report(y, y_pred,
+                                target_names=["CLEAR","ALERT"], digits=4),
+            "feat_imp":     dict(zip(FEATURE_NAMES,
+                                self._clf.feature_importances_.round(4).tolist())),
+            "n_pos": int(y.sum()), "n_neg": int(len(y)-y.sum()),
+        }
+        return self
+
+    def predict(self, features: dict) -> float:
+        if not self._trained: return 0.5
+        from feature_engine.feature_builder import FEATURE_NAMES
+        vec = np.array([[features.get(k,0.0) for k in FEATURE_NAMES]], dtype=np.float32)
+        return float(self._clf.predict_proba(vec)[0,1])
+
+    def print_report(self):
+        if not self._metrics:
+            print("  Model not trained — no report available."); return
+        m = self._metrics
+        bar = "═"*68
+        print(f"\n{bar}\n  ML MODEL ACCURACY REPORT\n{bar}")
+        print(f"  Training samples : {self._n_train}  "
+              f"({m['n_pos']} AML positives / {m['n_neg']} negatives)")
+        print("  Validation       : 5-fold stratified cross-validation\n")
+        print("  ── Cross-Validation Metrics ─────────────────────────────────")
+        print(f"  ROC-AUC     {m['cv_roc_auc']:.4f}  (±{m['cv_roc_std']:.4f})  "
+              "← main quality indicator")
+        print(f"  PR-AUC      {m['cv_pr_auc']:.4f}   ← precision-recall tradeoff")
+        print(f"  F1 Score    {m['cv_f1']:.4f}")
+        print(f"  Precision   {m['cv_precision']:.4f}   "
+              "← of raised alerts, how many are real AML?")
+        print(f"  Recall      {m['cv_recall']:.4f}   "
+              "← of real AML cases, how many are caught?")
+        print(f"\n  ── Train-set Metrics (upper bound — NOT for evaluation) ─────")
+        print(f"  ROC-AUC     {m['tr_roc_auc']:.4f}")
+        print(f"  PR-AUC      {m['tr_pr_auc']:.4f}")
+        cm = m["cm"]
+        tn,fp,fn,tp = cm[0][0],cm[0][1],cm[1][0],cm[1][1]
+        total = tn+fp+fn+tp
+        print(f"\n  ── Confusion Matrix (train set) ─────────────────────────────")
+        print(f"                   Predicted CLEAR  Predicted ALERT")
+        print(f"  Actual CLEAR     {tn:>15,}  {fp:>15,}")
+        print(f"  Actual ALERT     {fn:>15,}  {tp:>15,}")
+        print(f"\n  TP={tp}  FP={fp}  TN={tn}  FN={fn}  Total={total}")
+        print(f"  Accuracy          {(tp+tn)/total:.4f}")
+        print(f"  False Alert Rate  {fp/(fp+tn+1e-9):.4f}  "
+              "(% of clean persons wrongly alerted)")
+        print(f"  False Discovery   {fp/(tp+fp+1e-9):.4f}  "
+              "(% of raised alerts that are wrong)")
+        print(f"\n  ── Classification Report ────────────────────────────────────")
+        print(textwrap.indent(m["clf_report"], "  "))
+        print("  ── Feature Importances (top 8) ──────────────────────────────")
+        for fname, fval in sorted(m["feat_imp"].items(), key=lambda x:-x[1])[:8]:
+            print(f"  {fname:<30} {fval:.4f}  [{_bar(min(fval*6,1.0),24)}]")
+        roc = m["cv_roc_auc"]
+        verdict = ("Excellent" if roc>=0.95 else "Good" if roc>=0.85
+                   else "Fair" if roc>=0.70 else "Weak — need more/better training data")
+        print(f"\n  Verdict: ROC-AUC {roc:.2f} = {verdict}")
+        print("  NOTE: metrics are on synthetic training data.")
+        print("  With real labelled AML cases they will be more meaningful.")
+        print("  See REAL_DATA_INTEGRATION.md for how to use real data.")
+        print(bar)
+
+
+# ── Screen one person ─────────────────────────────────────────────────────────
+
+def _find_row(entity_id, job, registry):
+    for ds in job.datasets:
+        for et in ds.entity_types:
+            df = registry.get(ds.code, et)
+            if df.empty: continue
+            mask = df["entity_id"] == entity_id
+            if mask.any(): return df[mask].iloc[0]
+    return None
+
+
+def screen_one(name, country="", dob="", entity_type="INDIVIDUAL",
+               job_type="SAN", id_number="",
+               registry=None, multi_idx=None,
+               rule_engine=None, ml_engine=None, graph=None) -> dict:
+    from orchestration.orchestrator import ScreeningInput
+    from routing_engine.router import route
+    from config.job_types import get_job
+    from scoring.consolidator import consolidate
+    from policy_engine.thresholds import apply_threshold
+    from feature_engine.feature_builder import build_features, FEATURE_NAMES
+
+    inp      = ScreeningInput(name=name, entity_type=entity_type, job_type=job_type,
+                              country=country, dob=dob, id_number=id_number)
+    routing  = route(job_type, entity_type, country)
+    job_code = routing.job_code
+    job      = get_job(job_code)
+    inp_dict = inp.to_rule_dict()
+
+    t0 = time.perf_counter()
+    all_res = []
+    for ds in sorted(job.datasets, key=lambda x: x.priority):
+        for et in ds.entity_types:
+            cands, exact = multi_idx.query_dataset(ds.code, et, inp.name,
+                                                   identifier=inp.get_identifier())
+            if cands.empty: continue
+            for _, row in cands.head(500).iterrows():
+                all_res.append(rule_engine.apply(inp_dict, row, job_code, ds.code, exact))
+    cr       = consolidate(inp.name, entity_type, job_code, all_res, 0.30)
+    rule_ms  = (time.perf_counter()-t0)*1000
+    rule_sc  = cr.consolidated_score
+    rule_dec = apply_threshold(rule_sc, job_code).decision
+
+    # Integration
+    ml_sc = graph_sc = None; feats = {}
+    if cr.top_hit and ml_engine:
+        th  = cr.top_hit
+        row = _find_row(th.entity_id, job, registry)
+        if row is not None:
+            ars = th.all_rule_scores or {}
+            c   = th.name_score
+            mr  = {"composite_score":c,"score_token_sort":ars.get("I020O",c),
+                   "score_token_set":ars.get("I020O",c),"score_partial":ars.get("I020O",c)*0.9,
+                   "score_jaro_winkler":ars.get("I020O",c)*0.95,"matched_on_alias":th.matched_on_alias}
+            feats  = build_features(match_result=mr, input_record=inp_dict,
+                                    candidate_row=row, rule_result=th)
+            ml_sc  = ml_engine.predict(feats)
+            graph_sc = (float(graph.nodes[th.entity_id]["risk"])
+                        if graph and graph.has_node(th.entity_id)
+                        else float(row.get("risk_weight",0.5)))
+
+    blended = (min(1.0, round(rule_sc*0.50 + ml_sc*0.30 + graph_sc*0.20, 4))
+               if ml_sc is not None else rule_sc)
+    int_dec = apply_threshold(blended, job_code).decision
+
+    return {
+        "input_name": inp.name, "country": country or "—", "dob": dob or "—",
+        "entity_type": entity_type, "job_code": job_code,
+        "threshold": routing.threshold, "risk_tier": routing.risk_tier,
+        "n_candidates": len(all_res), "n_hits": len(cr.hits),
+        "top_hit_name": cr.top_hit.primary_name if cr.top_hit else "—",
+        "top_hit_rule": cr.top_hit.rule_code    if cr.top_hit else "—",
+        "all_rule_scores": cr.top_hit.all_rule_scores if cr.top_hit else {},
+        "rule_score": rule_sc, "rule_decision": rule_dec,
+        "ml_score": ml_sc, "graph_risk": graph_sc,
+        "blended_score": blended, "int_decision": int_dec,
+        "features": feats, "latency_ms": round(rule_ms, 1),
+    }
+
+
+# ── Print per-person comparison ───────────────────────────────────────────────
+
+def print_result(r: dict, idx: int, total: int):
+    sep = "═"*(W*2+5)
+    print(f"\n{sep}")
+    print(f"  PERSON {idx}/{total}:  {_col(r['input_name'], BOLD)}")
+    print(sep)
+    _row(_col("  WITHOUT INTEGRATION", BOLD), _col("  WITH INTEGRATION", BOLD))
+    _row(_col("  (rule-based score only)", DIM), _col("  (rule + ML + graph)", DIM))
+    _div()
+    _row(f"  Country   : {r['country']}",  f"  Country   : {r['country']}")
+    _row(f"  DOB       : {r['dob']}",       f"  DOB       : {r['dob']}")
+    _row(f"  Job       : {r['job_code']}", f"  Job       : {r['job_code']}")
+    _row(f"  Threshold : {r['threshold']}",f"  Threshold : {r['threshold']}")
+    _row(f"  Risk tier : {r['risk_tier']}", f"  Risk tier : {r['risk_tier']}")
+    _div("·")
+    _row(f"  Candidates screened : {r['n_candidates']}",
+         f"  Candidates screened : {r['n_candidates']}")
+    _row(f"  Hits (score ≥ 0.30) : {r['n_hits']}",
+         f"  Hits (score ≥ 0.30) : {r['n_hits']}")
+    if r["top_hit_name"] != "—":
+        _row(f"  Best match : {r['top_hit_name'][:35]}",
+             f"  Best match : {r['top_hit_name'][:35]}")
+        _row(f"  Winning rule : {r['top_hit_rule']}", "")
+
+    # Rule scores
+    ars = r["all_rule_scores"]
+    if ars:
+        _div("·")
+        _row("  Rule chain scores:", "  ML feature values:")
+        RLABELS = {"I010O":"Exact","I020O":"Fuzzy","I030O":"Reversed",
+                   "I040O":"Given/Family","I050O":"Abbreviated",
+                   "I060O":"Phonetic","I070O":"Transliteration","I080O":"DOB cluster"}
+        for code in ["I010O","I020O","I030O","I040O","I050O","I060O","I070O","I080O"]:
+            sc = ars.get(code, 0.0)
+            b  = _bar(sc, 12)
+            fk = f"rule_score_{code[:5].lower()}"
+            fv = r["features"].get(fk)
+            rs = f"  {fk} = {fv:.4f}" if fv is not None else ""
+            _row(f"  {code} {RLABELS.get(code,''):<16} {sc:.3f} [{b}]", rs)
+
+    # Score breakdown
+    _div("·")
+    _row(f"  Rule score   : {r['rule_score']:.4f}",
+         f"  Rule  (×0.50): {r['rule_score']:.4f} → {r['rule_score']*0.50:.4f}")
+    if r["ml_score"] is not None:
+        _row("  ML score     : not computed",
+             f"  ML    (×0.30): {r['ml_score']:.4f} → {r['ml_score']*0.30:.4f}")
+        _row("  Graph risk   : not computed",
+             f"  Graph (×0.20): {r['graph_risk']:.4f} → {r['graph_risk']*0.20:.4f}")
+    else:
+        _row("  ML score     : N/A (no match found)", "  ML    (×0.30): N/A")
+        _row("  Graph risk   : N/A (no match found)", "  Graph (×0.20): N/A")
+    _div("─")
+    _row(f"  FINAL SCORE  : {r['rule_score']:.4f}",
+         f"  FINAL SCORE  : {r['blended_score']:.4f}")
+    _div("─")
+    _row(f"  DECISION : {_dec_col(r['rule_decision'], r['rule_score'])}",
+         f"  DECISION : {_dec_col(r['int_decision'],  r['blended_score'])}")
+
+    if r["ml_score"] is not None:
+        diff = r["blended_score"] - r["rule_score"]
+        if abs(diff) > 0.001:
+            _row("", f"  Score Δ : {'↑ +' if diff>0 else '↓ '}{diff:.4f}")
+        if r["rule_decision"] != r["int_decision"]:
+            _div("!")
+            print(_col(f"  ⚡ Decision changed:  "
+                       f"{r['rule_decision']} → {r['int_decision']}", YEL))
+    _row(f"  Latency : {r['latency_ms']:.1f} ms", "")
+
+
+# ── Batch summary ─────────────────────────────────────────────────────────────
+
+def print_batch_summary(results):
+    sep = "═"*100
+    print(f"\n{sep}\n  BATCH SUMMARY\n{sep}")
+    print(f"  {'#':<3} {'Name':<30} {'Rule Sc':<10} {'Rule Dec':<12} "
+          f"{'Blended':<10} {'Int Dec':<12} {'Changed'}")
+    print(f"  {'─'*3} {'─'*30} {'─'*10} {'─'*12} {'─'*10} {'─'*12} {'─'*7}")
+    for i, r in enumerate(results, 1):
+        d_r=r["rule_decision"]; d_i=r["int_decision"]
+        c_r=RED if d_r=="ALERT" else YEL if d_r=="REVIEW" else GRN
+        c_i=RED if d_i=="ALERT" else YEL if d_i=="REVIEW" else GRN
+        chg=_col("YES ⚡",YEL) if d_r!=d_i else ""
+        print(f"  {i:<3} {r['input_name'][:30]:<30} {r['rule_score']:<10.4f} "
+              f"{_col(f'{d_r:<12}',c_r)} {r['blended_score']:<10.4f} "
+              f"{_col(f'{d_i:<12}',c_i)} {chg}")
+    print()
+    n=len(results)
+    ra=sum(1 for r in results if r["rule_decision"]=="ALERT")
+    ia=sum(1 for r in results if r["int_decision"]=="ALERT")
+    ch=sum(1 for r in results if r["rule_decision"]!=r["int_decision"])
+    print(f"  Total screened : {n}")
+    print(f"  Rule-only ALERT: {ra}  ({ra/max(n,1)*100:.0f}%)")
+    print(f"  Integrated ALERT: {ia}  ({ia/max(n,1)*100:.0f}%)")
+    print(f"  Decisions changed: {ch}")
+
+
+# ── Infrastructure loader ─────────────────────────────────────────────────────
+
+def load_infrastructure(verbose=True):
+    from data_layer.registry.dataset_registry import DatasetRegistry
+    from blocking_engine.inverted_index import MultiDatasetIndex
+    from matching_engine.rules.base_rule import MatchingRuleEngine
+    from graph_engine.graph import build_graph, propagate_risk
+
+    if verbose:
+        print("\n" + "="*52)
+        print("  AML Enterprise Screener — Starting")
+        print("="*52)
+
+    reg = DatasetRegistry().load_all(verbose=verbose)
+
+    if verbose: print("  Building inverted index ...", end=" ", flush=True)
+    t0 = time.perf_counter()
+    mi = MultiDatasetIndex()
+    mi.build_from_registry(reg, verbose=False)
+    if verbose: print(f"done  ({(time.perf_counter()-t0)*1000:.0f} ms)")
+
+    re = MatchingRuleEngine(use_llm=False)
+
+    if verbose: print("  Building graph engine   ...", end=" ", flush=True)
+    t0 = time.perf_counter()
+    combined = pd.concat(list(reg._store.values()), ignore_index=True)
+    G = build_graph(combined, add_country_edges=True,
+                    add_alias_edges=True, add_id_prefix_edges=False)
+    G = propagate_risk(G, iterations=3, damping=0.15)
+    if verbose: print(f"done  ({G.number_of_nodes():,} nodes, "
+                      f"{G.number_of_edges():,} edges, "
+                      f"{(time.perf_counter()-t0)*1000:.0f} ms)")
+
+    if verbose: print("  Training ML engine      ...", end=" ", flush=True)
+    t0 = time.perf_counter()
+    ml = MLEngine().train(reg)
+    if verbose: print(f"done  ({(time.perf_counter()-t0)*1000:.0f} ms)")
+
+    if verbose: print("="*52+"\n")
+    return reg, mi, re, ml, G
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(description="AML screener — per-person risk comparison")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--name",  help="Single name")
+    g.add_argument("--names", help="Comma-separated names")
+    g.add_argument("--csv",   help="CSV file (needs 'name' column)")
+    p.add_argument("--country",     default="")
+    p.add_argument("--dob",         default="")
+    p.add_argument("--entity-type", default="INDIVIDUAL")
+    p.add_argument("--job",         default="SAN")
+    p.add_argument("--id-number",   default="")
+    p.add_argument("--model-report",action="store_true")
+    p.add_argument("--quiet",       action="store_true")
+    args = p.parse_args()
+
+    reg, mi, re, ml, G = load_infrastructure(verbose=not args.quiet)
+
+    persons = []
+    if args.name:
+        persons.append({"name":args.name,"country":args.country,"dob":args.dob,
+                        "entity_type":args.entity_type,"job_type":args.job,"id_number":args.id_number})
+    elif args.names:
+        for n in args.names.split(","):
+            n=n.
