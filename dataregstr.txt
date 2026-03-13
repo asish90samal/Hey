@@ -1,0 +1,228 @@
+"""
+data_layer/registry/dataset_registry.py
+════════════════════════════════════════
+Loads watchlist data from saved CSVs (fast) or generates fresh (fallback).
+
+Run  save_datasets.py  once first.  After that every run uses saved CSVs.
+To use real AML data:  registry.load_from_real_data("path/to/folder")
+See  REAL_DATA_INTEGRATION.md  for the required column format.
+"""
+from __future__ import annotations
+import os, importlib
+import pandas as pd
+from config.job_types import JOB_REGISTRY
+
+ROOT     = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DATA_DIR = os.path.join(ROOT, "data")
+
+# CSV filename → (module, function, default_kwargs)
+_GEN_MAP = {
+    "san_individual.csv":  ("data_layer.generators.san_individual", "generate",           {"n": 5000, "seed": 42}),
+    "san_entity.csv":      ("data_layer.generators.san_entity",     "generate",           {"n": 3000, "seed": 42}),
+    "scion.csv":           ("data_layer.generators.scion",          "generate",           {"n": 2000, "seed": 42}),
+    "pep.csv":             ("data_layer.generators.pep",            "generate",           {"n": 2000, "seed": 42}),
+    "nns_articles.csv":    ("data_layer.generators.nns",            "generate_articles",  {"n": 3000, "seed": 42}),
+    "nns_structured.csv":  ("data_layer.generators.nns",            "generate_structured",{"n": 2000, "seed": 42}),
+}
+_CTRY_CSV = "country_risk.csv"
+_SIZE_MAP  = {
+    "san_individual.csv": "n_san_ind", "san_entity.csv": "n_san_ent",
+    "scion.csv": "n_scion", "pep.csv": "n_pep",
+    "nns_articles.csv": "n_nns_art", "nns_structured.csv": "n_nns_str",
+}
+
+
+class DatasetRegistry:
+    def __init__(self):
+        self._store: dict[tuple, pd.DataFrame] = {}
+        self._ctry_df: pd.DataFrame | None     = None
+        self._loaded  = False
+
+    # ── Primary load method ───────────────────────────────────────────────────
+
+    def load_all(self, n_san_ind=5000, n_san_ent=3000, n_scion=2000, n_pep=2000,
+                 n_nns_art=3000, n_nns_str=2000, seed=42, verbose=True,
+                 use_saved=True) -> "DatasetRegistry":
+        """
+        Load all datasets.
+
+        use_saved=True  → read from  data/*.csv  (run save_datasets.py first)
+        use_saved=False → generate fresh (slower, used for testing)
+        Falls back to generation automatically if a CSV is missing.
+        """
+        sizes = dict(n_san_ind=n_san_ind, n_san_ent=n_san_ent, n_scion=n_scion,
+                     n_pep=n_pep, n_nns_art=n_nns_art, n_nns_str=n_nns_str)
+
+        if verbose:
+            src = "saved CSVs" if (use_saved and os.path.isdir(DATA_DIR)) else "generators"
+            print(f"[Registry] Loading from {src} ...")
+
+        for csv_name, (mod_path, fn_name, base_kw) in _GEN_MAP.items():
+            csv_path = os.path.join(DATA_DIR, csv_name)
+            label    = csv_name.replace(".csv","").replace("_"," ").upper()
+
+            if use_saved and os.path.isfile(csv_path):
+                tag = "[CSV]"
+                df  = pd.read_csv(csv_path)
+            else:
+                tag = "[GEN]"
+                kw  = dict(base_kw)
+                kw["n"]    = sizes.get(_SIZE_MAP.get(csv_name,""), base_kw.get("n", 1000))
+                kw["seed"] = seed
+                mod = importlib.import_module(mod_path)
+                df  = getattr(mod, fn_name)(**kw)
+
+            if verbose:
+                print(f"  {tag} {label:20s} {len(df):>6,} rows")
+            self._ingest(df)
+
+        # Country risk
+        ctry_path = os.path.join(DATA_DIR, _CTRY_CSV)
+        if use_saved and os.path.isfile(ctry_path):
+            self._ctry_df = pd.read_csv(ctry_path)
+            if verbose: print(f"  [CSV] COUNTRY RISK           {len(self._ctry_df):>6,} rows")
+        else:
+            from data_layer.generators.ctry import generate
+            self._ctry_df = generate()
+            if verbose: print(f"  [GEN] COUNTRY RISK           {len(self._ctry_df):>6,} rows")
+
+        self._loaded = True
+        if verbose:
+            print(f"[Registry] Ready — {self.total_records():,} records\n")
+        return self
+
+    # ── Real data loader ──────────────────────────────────────────────────────
+
+    def load_from_real_data(self, folder: str, verbose=True) -> "DatasetRegistry":
+        """
+        Load from a folder of real AML CSV files.
+        See REAL_DATA_INTEGRATION.md for required columns.
+        Any missing file is skipped with a warning.
+        """
+        FILE_MAP = {
+            "ofac_sdn.csv":         ("OFAC_SDN",         "INDIVIDUAL"),
+            "un_consolidated.csv":  ("UN_CONSOLIDATED",  "INDIVIDUAL"),
+            "eu_sanctions.csv":     ("EU_SANCTIONS",     "INDIVIDUAL"),
+            "hm_treasury.csv":      ("HM_TREASURY",      "INDIVIDUAL"),
+            "interpol_red.csv":     ("INTERPOL_RED",     "INDIVIDUAL"),
+            "world_check.csv":      ("WORLD_CHECK",      "INDIVIDUAL"),
+            "dow_jones.csv":        ("DOW_JONES",        "INDIVIDUAL"),
+            "comply_advantage.csv": ("COMPLY_ADVANTAGE", "INDIVIDUAL"),
+            "accuity_firco.csv":    ("ACCUITY_FIRCO",    "INDIVIDUAL"),
+            "scion.csv":            ("SCION",            None),
+            "pep_database.csv":     ("PEP_DATABASE",     None),
+            "nns_articles.csv":     ("NNS_ARTICLES",     "INDIVIDUAL"),
+            "nns_structured.csv":   ("NNS_STRUCTURED",   "INDIVIDUAL"),
+        }
+        if verbose:
+            print(f"[Registry] Loading real data from: {folder}")
+
+        for fname, (ds_code, etype) in FILE_MAP.items():
+            fpath = os.path.join(folder, fname)
+            if not os.path.isfile(fpath):
+                if verbose: print(f"  [SKIP] {fname}")
+                continue
+            df = self._normalise_real(pd.read_csv(fpath), ds_code, etype)
+            self._ingest(df)
+            if verbose: print(f"  [REAL] {fname:28s} {len(df):,} rows")
+
+        ctry_path = os.path.join(folder, "country_risk.csv")
+        if os.path.isfile(ctry_path):
+            self._ctry_df = pd.read_csv(ctry_path)
+        else:
+            from data_layer.generators.ctry import generate
+            self._ctry_df = generate()
+            if verbose: print("  [NOTE] country_risk.csv not found — using built-in register")
+
+        self._loaded = True
+        if verbose:
+            print(f"[Registry] Ready — {self.total_records():,} records\n")
+        return self
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _normalise_real(self, df: pd.DataFrame,
+                        ds_code: str, etype: str | None) -> pd.DataFrame:
+        """Map real provider column names → internal schema, fill gaps."""
+        ALIASES = {
+            "name":"primary_name","full_name":"primary_name","entity_name":"primary_name",
+            "aka":"aliases","also_known_as":"aliases","date_of_birth":"dob","birth_date":"dob",
+            "country":"nationality","citizenship":"nationality",
+            "id":"entity_id","uid":"entity_id","reference":"entity_id",
+            "type":"entity_type","deceased":"is_deceased","risk":"risk_weight",
+        }
+        df = df.copy()
+        df.columns = [c.lower().strip().replace(" ","_") for c in df.columns]
+        for old, new in ALIASES.items():
+            if old in df.columns and new not in df.columns:
+                df.rename(columns={old: new}, inplace=True)
+
+        DEFAULTS: dict[str, object] = {
+            "entity_id":      [f"{ds_code}_{i:07d}" for i in range(len(df))],
+            "dataset_type":   ds_code,
+            "entity_type":    etype or "INDIVIDUAL",
+            "primary_name":   "", "aliases": "", "dob": "",
+            "gender":         "UNKNOWN", "nationality": "UNKNOWN",
+            "id_number":      "", "address_country": "UNKNOWN",
+            "is_deceased":    False, "risk_weight": 0.70, "risk_label": 0,
+        }
+        for col, default in DEFAULTS.items():
+            if col not in df.columns:
+                df[col] = default
+
+        df["dataset_type"]  = ds_code
+        if etype:
+            df["entity_type"] = etype
+        df["primary_name"] = df["primary_name"].astype(str).str.upper().str.strip()
+        df["nationality"]  = df["nationality"].astype(str).str.upper().str.strip()
+        return df
+
+    def _ingest(self, df: pd.DataFrame) -> None:
+        for (ds, et), part in df.groupby(["dataset_type","entity_type"]):
+            key = (str(ds).upper(), str(et).upper())
+            if key in self._store:
+                self._store[key] = pd.concat([self._store[key], part], ignore_index=True)
+            else:
+                self._store[key] = part.reset_index(drop=True)
+
+    # ── Query API ─────────────────────────────────────────────────────────────
+
+    def get(self, dataset_code: str, entity_type: str | None = None) -> pd.DataFrame:
+        c = dataset_code.upper()
+        if entity_type:
+            return self._store.get((c, entity_type.upper()), pd.DataFrame())
+        parts = [df for (cc,_), df in self._store.items() if cc == c]
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    def get_country_register(self) -> pd.DataFrame:
+        return self._ctry_df if self._ctry_df is not None else pd.DataFrame()
+
+    def get_for_job(self, job_code: str) -> list:
+        jc = job_code.strip().upper()
+        if jc not in JOB_REGISTRY: raise ValueError(f"Unknown job '{jc}'")
+        job = JOB_REGISTRY[jc]
+        out = []
+        for ds in sorted(job.datasets, key=lambda x: x.priority):
+            for et in ds.entity_types:
+                df = self.get(ds.code, entity_type=et)
+                if not df.empty: out.append((ds.code, df))
+        return out
+
+    def list_partitions(self) -> list[tuple]:
+        return [(c,e,len(df)) for (c,e),df in sorted(self._store.items())]
+
+    def list_datasets(self) -> list[tuple]:
+        return self.list_partitions()          # alias used by MultiDatasetIndex
+
+    def total_records(self) -> int:
+        return sum(len(df) for df in self._store.values())
+
+    def summary(self) -> str:
+        lines = ["DatasetRegistry", "="*52]
+        for c,e,n in self.list_partitions():
+            lines.append(f"  {c:<22} {e:<12} {n:>7,}")
+        if self._ctry_df is not None:
+            lines.append(f"  {'COUNTRY_RISK':<22} {'LOOKUP':<12} {len(self._ctry_df):>7}")
+        lines.append("-"*52)
+        lines.append(f"  {'TOTAL':<34} {self.total_records():>7,}")
+        return "\n".join(lines)
