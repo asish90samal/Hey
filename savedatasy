@@ -1,0 +1,85 @@
+"""
+save_datasets.py
+════════════════════════════════════════════════════════════
+Run this ONCE to generate all synthetic watchlist data and
+save it to CSV files in the  data/  folder.
+
+After this runs, aml_screen.py loads from saved CSVs every
+time — no regeneration, no faker needed at runtime.
+
+Usage:
+    cd AML_ENTERPRISE_OPTIMISED
+    python save_datasets.py
+
+Saved files:
+    data/san_individual.csv    ~5 000 rows
+    data/san_entity.csv        ~3 000 rows
+    data/scion.csv             ~2 000 rows
+    data/pep.csv               ~2 000 rows
+    data/nns_articles.csv      ~3 000 rows
+    data/nns_structured.csv    ~2 000 rows
+    data/country_risk.csv          32 rows
+    data/manifest.json         row counts + timestamp
+════════════════════════════════════════════════════════════
+"""
+from __future__ import annotations
+import os, sys, json
+from datetime import datetime, timezone
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+DATA_DIR = os.path.join(ROOT, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# (label, module, function, kwargs)
+_JOBS = [
+    ("SAN INDIVIDUAL",  "data_layer.generators.san_individual", "generate",          {"n": 5000, "seed": 42}),
+    ("SAN ENTITY",      "data_layer.generators.san_entity",     "generate",          {"n": 3000, "seed": 42}),
+    ("SCION",           "data_layer.generators.scion",          "generate",          {"n": 2000, "seed": 42}),
+    ("PEP",             "data_layer.generators.pep",            "generate",          {"n": 2000, "seed": 42}),
+    ("NNS ARTICLES",    "data_layer.generators.nns",            "generate_articles", {"n": 3000, "seed": 42}),
+    ("NNS STRUCTURED",  "data_layer.generators.nns",            "generate_structured",{"n": 2000,"seed": 42}),
+    ("COUNTRY RISK",    "data_layer.generators.ctry",           "generate",          {}),
+]
+
+_FILENAMES = [
+    "san_individual.csv", "san_entity.csv", "scion.csv", "pep.csv",
+    "nns_articles.csv", "nns_structured.csv", "country_risk.csv",
+]
+
+def main():
+    print("=" * 58)
+    print("  AML ENTERPRISE  —  Dataset Generator")
+    print("  Saving all synthetic watchlist data to  data/")
+    print("=" * 58)
+
+    manifest = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "seed": 42,
+        "files": {},
+    }
+
+    import importlib
+    for (label, mod_path, fn_name, kw), fname in zip(_JOBS, _FILENAMES):
+        print(f"  Generating  {label:<18} ...", end=" ", flush=True)
+        mod = importlib.import_module(mod_path)
+        df  = getattr(mod, fn_name)(**kw)
+        csv_path = os.path.join(DATA_DIR, fname)
+        df.to_csv(csv_path, index=False)
+        manifest["files"][fname] = {"rows": len(df), "cols": list(df.columns)}
+        print(f"{len(df):>6,} rows  →  data/{fname}")
+
+    with open(os.path.join(DATA_DIR, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    total = sum(v["rows"] for v in manifest["files"].values())
+    print("=" * 58)
+    print(f"  Done. {total:,} total rows saved to  data/")
+    print(f"  Run the screener next:")
+    print(f"    python aml_screen.py --name \"Mohammed Ali Hassan\" --country IRAN --dob 1970-03-15")
+    print("=" * 58)
+
+if __name__ == "__main__":
+    main()
