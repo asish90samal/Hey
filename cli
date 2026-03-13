@@ -1,0 +1,379 @@
+"""
+cli/screen.py
+─────────────
+Command-line entry point for the AML screener.
+
+This file's ONLY responsibilities:
+  1. Parse CLI arguments
+  2. Build the infrastructure by calling the proper layers
+  3. Call IntegratedScreeningOrchestrator.screen_integrated() per person
+  4. Print the per-person comparison display
+  5. Print the batch summary and optional model report
+
+Every piece of business logic lives in its proper layer:
+  Data loading    → data_layer/registry/dataset_registry.py
+  Blocking        → blocking_engine/inverted_index.py
+  Rule matching   → matching_engine/rules/
+  ML scoring      → ml_engine/model.py          (AMLModel)
+  Graph risk      → graph_engine/graph.py
+  Blending        → scoring/consolidator.py     (blend())
+  Policy          → policy_engine/thresholds.py
+  Orchestration   → orchestration/orchestrator.py (IntegratedScreeningOrchestrator)
+
+Usage
+─────
+  # Single name
+  python -m cli.screen --name "Mohammed Ali Hassan" --country IRAN --dob 1970-03-15
+
+  # Multiple names
+  python -m cli.screen --names "Virat Kohli, John Smith, Alexei Volkov"
+
+  # CSV file  (columns: name, country, dob, entity_type, job_type)
+  python -m cli.screen --csv customers.csv
+
+  # Full ML accuracy report
+  python -m cli.screen --csv customers.csv --model-report
+"""
+from __future__ import annotations
+import argparse, os, sys, textwrap, time
+import pandas as pd
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+# ── Display constants ─────────────────────────────────────────────────────────
+W     = 50
+BOLD  = "\033[1m";  GRAY  = "\033[90m"; RESET = "\033[0m"
+RED   = "\033[91m"; YEL   = "\033[93m"; GRN   = "\033[92m"
+
+def _p(s, w=W): return str(s)[:w].ljust(w)
+def _row(l, r): print(f"  {_p(l)} | {_p(r)}")
+def _div(c="-"): print(f"  {c*W} | {c*W}")
+def _col(s, c): return f"{c}{s}{RESET}"
+def _bar(v, w=16): n = int(round(v * w)); return "#" * n + "-" * (w - n)
+def _dec(d, score):
+    c = RED if d == "ALERT" else YEL if d == "REVIEW" else GRN
+    return _col(f"{d}  ({score:.4f})", c)
+
+
+# ── Infrastructure builder ────────────────────────────────────────────────────
+
+def build_infrastructure(verbose=True):
+    """
+    Initialise every layer in dependency order.
+    Returns the IntegratedScreeningOrchestrator ready to call .screen_integrated().
+    """
+    import pandas as pd
+    from data_layer.registry.dataset_registry import DatasetRegistry
+    from blocking_engine.inverted_index import MultiDatasetIndex
+    from matching_engine.rules.base_rule import MatchingRuleEngine
+    from graph_engine.graph import build_graph, propagate_risk
+    from ml_engine.model import AMLModel
+    from orchestration.orchestrator import IntegratedScreeningOrchestrator
+
+    if verbose:
+        print("\n" + "=" * 55)
+        print("  AML ENTERPRISE SCREENER  |  Initialising")
+        print("=" * 55)
+
+    # 1. Data layer
+    registry = DatasetRegistry()
+    registry.load_all(verbose=verbose)
+
+    # 2. Blocking / index layer
+    if verbose: print("  Inverted index          ...", end=" ", flush=True)
+    t = time.perf_counter()
+    idx = MultiDatasetIndex()
+    idx.build_from_registry(registry, verbose=False)
+    if verbose: print(f"done  {(time.perf_counter()-t)*1000:.0f} ms")
+
+    # 3. Matching rule engine
+    rule_engine = MatchingRuleEngine(use_llm=False)
+
+    # 4. Graph layer
+    if verbose: print("  Graph engine            ...", end=" ", flush=True)
+    t = time.perf_counter()
+    combined = pd.concat(list(registry._store.values()), ignore_index=True)
+    G = build_graph(combined, add_country_edges=True, add_alias_edges=True,
+                    add_id_prefix_edges=False)
+    G = propagate_risk(G, iterations=3, damping=0.15)
+    if verbose: print(f"done  {G.number_of_nodes()} nodes  {(time.perf_counter()-t)*1000:.0f} ms")
+
+    # 5. ML layer
+    if verbose: print("  ML model                ...", end=" ", flush=True)
+    t = time.perf_counter()
+    model = AMLModel()
+    X, y  = AMLModel.build_training_data(registry)
+    model.train(X, y)
+    if verbose: print(f"done  {(time.perf_counter()-t)*1000:.0f} ms")
+
+    if verbose: print("=" * 55 + "\n")
+
+    # 6. Orchestration layer
+    return IntegratedScreeningOrchestrator(
+        registry=registry,
+        multi_index=idx,
+        rule_engine=rule_engine,
+        ml_model=model,
+        graph=G,
+    ), model
+
+
+# ── Per-person display ────────────────────────────────────────────────────────
+
+_RULE_LABELS = {
+    "I010O": "Exact match",      "I020O": "Fuzzy composite",
+    "I030O": "Token reversed",   "I040O": "Given/family split",
+    "I050O": "Abbreviated",      "I060O": "Phonetic",
+    "I070O": "Transliteration",  "I080O": "DOB cluster",
+}
+
+
+def print_comparison(out, num: int, total: int):
+    """
+    Print the side-by-side comparison for one IntegratedOutput.
+    Left = rule score only.  Right = blended score.
+    """
+    from orchestration.orchestrator import IntegratedOutput
+
+    bar = "=" * (W * 2 + 5)
+    print(f"\n{bar}")
+    print(f"  PERSON {num}/{total}  --  {out.input.name}")
+    print(bar)
+    _row(_col("  WITHOUT INTEGRATION", BOLD),      _col("  WITH INTEGRATION", BOLD))
+    _row(_col("  (rule-based only)", GRAY),         _col("  (rule 50% + ML 30% + graph 20%)", GRAY))
+    _div()
+
+    country = out.input.country or out.input.nationality or "N/A"
+    dob     = out.input.dob or "N/A"
+    _row(f"  Country    : {country}",   f"  Country    : {country}")
+    _row(f"  DOB        : {dob}",       f"  DOB        : {dob}")
+    _row(f"  Job code   : {out.job_code}", f"  Job code   : {out.job_code}")
+    _div(".")
+
+    cr = out.consolidated
+    top_name = cr.top_hit.primary_name if cr and cr.top_hit else "No match found"
+    n_cands  = sum(1 for _ in (cr.hits if cr else []))  # approximation
+    n_hits   = len(cr.hits) if cr else 0
+    _row(f"  Hits (>=0.30) : {n_hits}", f"  Hits (>=0.30) : {n_hits}")
+    _row(f"  Top match     : {top_name[:44]}", f"  Top match     : {top_name[:44]}")
+
+    # Rule chain breakdown
+    if cr and cr.top_hit and cr.top_hit.all_rule_scores:
+        _div(".")
+        _row("  Rule chain scores:", "  Blend arithmetic:")
+        for code, score in cr.top_hit.all_rule_scores.items():
+            winner = " <-" if code == cr.top_hit.rule_code else ""
+            ltext  = f"  {code} {_RULE_LABELS.get(code,''):<18} {score:.3f} [{_bar(score)}]{winner}"
+            _row(ltext, "")
+
+    # Score arithmetic
+    rs = out.rule_score
+    ms = out.ml_score
+    gs = out.graph_risk
+    bs = out.blended_score
+    _div(".")
+    _row(f"  Rule score  : {rs:.4f}",
+         f"  Rule  {rs:.4f} x 0.50 = {rs*0.50:.4f}")
+    _row("  ML score    : not computed",
+         f"  ML    {f'{ms:.4f} x 0.30 = {ms*0.30:.4f}' if ms is not None else 'N/A (no hit)'}")
+    _row("  Graph risk  : not computed",
+         f"  Graph {f'{gs:.4f} x 0.20 = {gs*0.20:.4f}' if gs is not None else 'N/A (no hit)'}")
+    _div("-")
+    _row(f"  FINAL SCORE : {rs:.4f}  (rule only)",
+         f"  FINAL SCORE : {bs:.4f}  (blended)")
+    _div("-")
+
+    from policy_engine.thresholds import apply_threshold
+    rule_dec = apply_threshold(rs, out.job_code).decision
+    _row(f"  DECISION : {_dec(rule_dec, rs)}", f"  DECISION : {_dec(out.overall_decision, bs)}")
+
+    if out.fp_flag:
+        _div("!")
+        print(_col("  [!] POSSIBLE FALSE POSITIVE", YEL))
+        for part in out.fp_reason.split(";"):
+            print(_col(f"      * {part.strip()}", YEL))
+        print(_col("  Recommend manual review before raising an alert.", YEL))
+
+    if rule_dec != out.overall_decision:
+        _div("!")
+        diff = bs - rs
+        direction = f"UP +{diff:.4f}" if diff > 0 else f"DOWN {diff:.4f}"
+        print(_col(f"  [!] INTEGRATION CHANGED DECISION: {rule_dec} -> {out.overall_decision}  ({direction})", YEL))
+
+    _row(f"  Latency : {out.latency_ms:.1f} ms", f"  Latency : {out.latency_ms:.1f} ms (shared)")
+
+
+# ── Batch summary ─────────────────────────────────────────────────────────────
+
+def print_batch_summary(outputs: list):
+    from policy_engine.thresholds import apply_threshold
+    bar = "=" * 105
+    print(f"\n{bar}")
+    print("  BATCH SUMMARY")
+    print(bar)
+    print(f"  {'#':<3} {'Name':<28} {'Rule':>7} {'Rule Dec':<10} {'Blended':>8} {'Int Dec':<10} {'Changed':<8} {'FP?'}")
+    print(f"  {'-'*100}")
+
+    for i, out in enumerate(outputs, 1):
+        rs       = out.rule_score
+        bs       = out.blended_score
+        rule_dec = apply_threshold(rs, out.job_code).decision
+        int_dec  = out.overall_decision
+        cr       = RED if rule_dec == "ALERT" else YEL if rule_dec == "REVIEW" else GRN
+        ci       = RED if int_dec  == "ALERT" else YEL if int_dec  == "REVIEW" else GRN
+        chg      = _col("YES", YEL) if rule_dec != int_dec else "   "
+        fp       = _col("[!]", YEL) if out.fp_flag else "   "
+        print(f"  {i:<3} {out.input.name[:28]:<28} {rs:>7.4f} {_col(rule_dec,cr):<10} "
+              f"{bs:>8.4f} {_col(int_dec,ci):<10} {chg}  {fp}")
+
+    print()
+    n    = len(outputs)
+    from policy_engine.thresholds import apply_threshold as at
+    r_al = sum(1 for o in outputs if at(o.rule_score,  o.job_code).decision == "ALERT")
+    i_al = sum(1 for o in outputs if o.overall_decision == "ALERT")
+    chg  = sum(1 for o in outputs if at(o.rule_score, o.job_code).decision != o.overall_decision)
+    fpc  = sum(1 for o in outputs if o.fp_flag)
+    print(f"  Total screened         : {n}")
+    print(f"  Rule-only  ALERTS      : {r_al} ({r_al/max(n,1)*100:.0f}%)")
+    print(f"  Integrated ALERTS      : {i_al} ({i_al/max(n,1)*100:.0f}%)")
+    print(f"  Decisions changed      : {chg}")
+    print(f"  Possible false pos [!] : {fpc}")
+    print(bar)
+
+
+# ── Model report (delegates to ml_engine/model.py cv_metrics) ────────────────
+
+def print_model_report(model):
+    """Print full ML accuracy report from AMLModel.cv_metrics."""
+    m = model.cv_metrics
+    if not m:
+        print("  No metrics available (model not trained or insufficient data).")
+        return
+
+    bar = "=" * 65
+    print(f"\n{bar}")
+    print("  ML MODEL ACCURACY REPORT")
+    print(bar)
+    print(f"\n  Training data")
+    print(f"    Total samples : {m['n_samples']}")
+    print(f"    Positives     : {m['n_pos']}  (risk_label=1 records)")
+    print(f"    Negatives     : {m['n_neg']}  (cross-mismatched non-match pairs)")
+    print(f"    Evaluation    : 5-fold stratified cross-validation\n")
+
+    print(f"  {'Metric':<32} {'Mean':>8}  {'Std':>8}")
+    print(f"  {'-'*50}")
+    print(f"  {'ROC-AUC':<32} {m['cv_roc_auc']:>8.4f}  +/-{m['cv_roc_std']:.4f}")
+    print(f"  {'PR-AUC (avg precision)':<32} {m['cv_pr_auc']:>8.4f}")
+    print(f"  {'F1 Score':<32} {m['cv_f1']:>8.4f}")
+    print(f"  {'Precision':<32} {m['cv_precision']:>8.4f}")
+    print(f"  {'Recall':<32} {m['cv_recall']:>8.4f}")
+    print(f"\n  Train-set ROC-AUC : {m['train_auc']:.4f}  (upper bound only)")
+
+    cm = m["cm"]
+    tn, fp, fn, tp = cm[0][0], cm[0][1], cm[1][0], cm[1][1]
+    total = tn + fp + fn + tp
+    print(f"\n  Confusion Matrix (train set)")
+    print(f"                    Predicted CLEAR   Predicted ALERT")
+    print(f"  Actual CLEAR      {tn:>15}   {fp:>15}")
+    print(f"  Actual ALERT      {fn:>15}   {tp:>15}")
+    print(f"\n  Accuracy = {(tp+tn)/total:.4f}  |  FPR = {fp/(fp+tn+1e-9):.4f}  |  FDR = {fp/(tp+fp+1e-9):.4f}")
+
+    print(f"\n  Classification Report\n")
+    print(textwrap.indent(m["cls_report"], "  "))
+
+    print("  Top 5 Feature Importances")
+    top5 = sorted(m["feature_importances"].items(), key=lambda x: -x[1])[:5]
+    for fname, fval in top5:
+        print(f"    {fname:<32} {fval:.4f}  [{_bar(min(fval * 3, 1.0), 16)}]")
+
+    roc = m["cv_roc_auc"]
+    if   roc >= 0.95: msg = "Excellent — very reliable risk separation."
+    elif roc >= 0.85: msg = "Good — model adds clear value on borderline cases."
+    elif roc >= 0.70: msg = "Fair — model helps but rule score is still primary."
+    else:             msg = "Weak — need more / better labelled training data."
+    print(f"\n  Interpretation:  ROC-AUC {roc:.2f}: {msg}")
+    print(f"\n  NOTE: Metrics are on synthetic data. See REAL_DATA_INTEGRATION.md.")
+    print(f"\n{bar}\n")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AML Screener — per-person risk comparison (rule-only vs integrated)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    grp = parser.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--name",  help="Single name to screen")
+    grp.add_argument("--names", help="Comma-separated names")
+    grp.add_argument("--csv",   help="CSV file (columns: name, country, dob, ...)")
+
+    parser.add_argument("--country",     default="")
+    parser.add_argument("--dob",         default="")
+    parser.add_argument("--entity-type", default="INDIVIDUAL", dest="entity_type")
+    parser.add_argument("--job",         default="SAN",
+                        help="SAN | PEP | SCION | NNS | CTRY")
+    parser.add_argument("--id-number",   default="", dest="id_number")
+    parser.add_argument("--model-report", action="store_true")
+    parser.add_argument("--quiet",        action="store_true")
+    args = parser.parse_args()
+
+    orch, model = build_infrastructure(verbose=not args.quiet)
+
+    from orchestration.orchestrator import ScreeningInput
+
+    # Build persons list
+    persons: list[ScreeningInput] = []
+
+    if args.name:
+        persons.append(ScreeningInput(
+            name=args.name, country=args.country, dob=args.dob,
+            entity_type=args.entity_type, job_type=args.job, id_number=args.id_number,
+        ))
+
+    elif args.names:
+        for n in args.names.split(","):
+            n = n.strip()
+            if n:
+                persons.append(ScreeningInput(
+                    name=n, country=args.country, dob=args.dob,
+                    entity_type=args.entity_type, job_type=args.job,
+                ))
+
+    elif args.csv:
+        if not os.path.isfile(args.csv):
+            print(f"ERROR: CSV not found: {args.csv}"); sys.exit(1)
+        df_in = pd.read_csv(args.csv)
+        df_in.columns = [c.lower().strip() for c in df_in.columns]
+        for _, row in df_in.iterrows():
+            persons.append(ScreeningInput(
+                name=        str(row.get("name", "")),
+                country=     str(row.get("country",     args.country)),
+                dob=         str(row.get("dob",         args.dob)),
+                entity_type= str(row.get("entity_type", args.entity_type)),
+                job_type=    str(row.get("job_type",    args.job)),
+                id_number=   str(row.get("id_number",   "")),
+            ))
+        if not args.quiet:
+            print(f"  Loaded {len(persons)} persons from {args.csv}\n")
+
+    if not persons:
+        print("No persons to screen."); sys.exit(0)
+
+    outputs = []
+    for i, inp in enumerate(persons, 1):
+        out = orch.screen_integrated(inp)
+        print_comparison(out, i, len(persons))
+        outputs.append(out)
+
+    if len(outputs) > 1:
+        print_batch_summary(outputs)
+
+    if args.model_report:
+        print_model_report(model)
+
+
+if __name__ == "__main__":
+    main()
