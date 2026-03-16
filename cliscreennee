@@ -1,0 +1,376 @@
+"""
+cli/screen_targeted.py
+Screen a name against ONE specific watchlist using a single InvertedIndex,
+with full ML + graph integration and the identical side-by-side display as cli/screen.py.
+
+LEFT  column = rule-based score only
+RIGHT column = blended score (rule 50 pct + ML 30 pct + graph 20 pct)
+
+If no --watchlist is given, defaults to OFAC_SDN / INDIVIDUAL.
+
+Usage
+_____
+  python -m cli.screen_targeted --name "Mohammed Ali Hassan"
+  python -m cli.screen_targeted --name "Ali Hassan" --watchlist PEP_DATABASE
+  python -m cli.screen_targeted --name "Ali Hassan" --watchlist UN_CONSOLIDATED --country IRAN --dob 1970-03-15
+  python -m cli.screen_targeted --name "Tehran Steel" --watchlist OFAC_SDN --entity-type ENTITY
+  python -m cli.screen_targeted --names "Ali Hassan, Virat Kohli, hello" --watchlist WORLD_CHECK
+  python -m cli.screen_targeted --csv customers.csv
+  python -m cli.screen_targeted --name "Ali Hassan" --model-report
+  python -m cli.screen_targeted --list-watchlists
+"""
+from __future__ import annotations
+import argparse, os, sys, textwrap, time
+import pandas as pd
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+# Display constants (identical to cli/screen.py)
+W    = 50
+BOLD = "\033[1m";  GRAY  = "\033[90m"; RESET = "\033[0m"
+RED  = "\033[91m"; YEL   = "\033[93m"; GRN   = "\033[92m"; CYN   = "\033[96m"
+
+def _p(s, w=W):    return str(s)[:w].ljust(w)
+def _row(l, r):    print(f"  {_p(l)} | {_p(r)}")
+def _div(c="-"):   print(f"  {c*W} | {c*W}")
+def _col(s, c):    return f"{c}{s}{RESET}"
+def _bar(v, w=16): n = int(round(v * w)); return chr(9608) * n + chr(9617) * (w - n)
+def _dec(d, score):
+    c = RED if d == "ALERT" else YEL if d == "REVIEW" else GRN
+    return _col(f"{d}  ({score:.4f})", c)
+
+_RULE_LABELS = {
+    "I010O": "Exact match",       "I020O": "Fuzzy composite",
+    "I030O": "Token reversed",    "I040O": "Given/family split",
+    "I050O": "Abbreviated",       "I060O": "Phonetic",
+    "I070O": "Transliteration",   "I080O": "DOB cluster",
+}
+
+_DATASET_JOB = {
+    "OFAC_SDN": "SAN",       "UN_CONSOLIDATED": "SAN",
+    "EU_SANCTIONS": "SAN",   "HM_TREASURY": "SAN",
+    "INTERPOL_RED": "SAN",   "WORLD_CHECK": "SAN",
+    "DOW_JONES": "SAN",      "COMPLY_ADVANTAGE": "SAN",
+    "ACCUITY_FIRCO": "SAN",  "SCION": "SCION",
+    "PEP_DATABASE": "PEP",   "NNS_ARTICLES": "NNS",
+    "NNS_STRUCTURED": "NNS",
+}
+
+
+# Infrastructure builder
+def build_infrastructure(watchlist, entity_type, verbose=True):
+    from data_layer.registry.dataset_registry import DatasetRegistry
+    from blocking_engine.inverted_index import InvertedIndex
+    from matching_engine.rules.base_rule import MatchingRuleEngine
+    from graph_engine.graph import build_graph, propagate_risk
+    from ml_engine.model import AMLModel
+    from orchestration.orchestrator import IntegratedScreeningOrchestrator
+
+    if verbose:
+        print("\n" + "=" * 55)
+        print(f"  AML TARGETED SCREENER  |  Initialising")
+        print(f"  Watchlist : {watchlist}  /  {entity_type}")
+        print("=" * 55)
+
+    registry = DatasetRegistry()
+    registry.load_all(verbose=verbose)
+
+    partition_df = registry.get(watchlist, entity_type=entity_type)
+    if partition_df.empty:
+        print(f"\n  [ERROR] No data for watchlist={watchlist!r} entity_type={entity_type!r}")
+        print("  Use --list-watchlists to see available options.\n")
+        sys.exit(1)
+
+    if verbose:
+        print(f"  Partition   : {len(partition_df):,} records  ({watchlist} / {entity_type})")
+
+    if verbose: print("  InvertedIndex           ...", end=" ", flush=True)
+    t = time.perf_counter()
+    single_idx = InvertedIndex()
+    single_idx.build(partition_df, verbose=False)
+    st = single_idx.stats()
+    if verbose:
+        print(f"done  {st['token_keys']:,} tokens  {st['id_keys']:,} IDs  {(time.perf_counter()-t)*1000:.0f} ms")
+
+    _wl = watchlist.upper()
+    _et = entity_type.upper()
+
+    class _Adapter:
+        def query_dataset(self, dataset_code, etype, name, identifier=None):
+            if dataset_code.upper() == _wl and etype.upper() == _et:
+                return single_idx.query_with_id(name, identifier=identifier)
+            return pd.DataFrame(), False
+
+    rule_engine = MatchingRuleEngine(use_llm=False)
+
+    if verbose: print("  Graph engine            ...", end=" ", flush=True)
+    t = time.perf_counter()
+    combined = pd.concat(list(registry._store.values()), ignore_index=True)
+    G = build_graph(combined, add_country_edges=True, add_alias_edges=True, add_id_prefix_edges=False)
+    G = propagate_risk(G, iterations=3, damping=0.15)
+    if verbose: print(f"done  {G.number_of_nodes():,} nodes  {(time.perf_counter()-t)*1000:.0f} ms")
+
+    if verbose: print("  ML model                ...", end=" ", flush=True)
+    t = time.perf_counter()
+    model = AMLModel()
+    X, y  = AMLModel.build_training_data(registry)
+    model.train(X, y)
+    if verbose: print(f"done  {(time.perf_counter()-t)*1000:.0f} ms")
+
+    if verbose: print("=" * 55 + "\n")
+
+    orch = IntegratedScreeningOrchestrator(
+        registry=registry,
+        multi_index=_Adapter(),
+        rule_engine=rule_engine,
+        ml_model=model,
+        graph=G,
+    )
+
+    job_prefix = _DATASET_JOB.get(_wl, "SAN")
+    job_code   = f"{job_prefix}_{'IND' if entity_type == 'INDIVIDUAL' else 'ENT'}"
+    return orch, model, job_code
+
+
+# Side-by-side display  (identical layout to cli/screen.py)
+def print_comparison(out, num, total, watchlist):
+    from policy_engine.thresholds import apply_threshold
+    bar = "=" * (W * 2 + 5)
+    print(f"\n{bar}")
+    print(f"  PERSON {num}/{total}  --  {out.input.name}  [watchlist: {_col(watchlist, CYN)}]")
+    print(bar)
+    _row(_col("  WITHOUT INTEGRATION", BOLD), _col("  WITH INTEGRATION", BOLD))
+    _row(_col("  (rule-based only)", GRAY),    _col("  (rule 50% + ML 30% + graph 20%)", GRAY))
+    _div()
+    country = out.input.country or out.input.nationality or "N/A"
+    dob     = out.input.dob or "N/A"
+    _row(f"  Watchlist  : {watchlist}",    f"  Watchlist  : {watchlist}")
+    _row(f"  Country    : {country}",      f"  Country    : {country}")
+    _row(f"  DOB        : {dob}",          f"  DOB        : {dob}")
+    _row(f"  Job code   : {out.job_code}", f"  Job code   : {out.job_code}")
+    _div(".")
+    cr       = out.consolidated
+    top_name = cr.top_hit.primary_name if cr and cr.top_hit else "No match found"
+    n_hits   = len(cr.hits) if cr else 0
+    _row(f"  Hits (>=0.30) : {n_hits}",        f"  Hits (>=0.30) : {n_hits}")
+    _row(f"  Top match     : {top_name[:44]}", f"  Top match     : {top_name[:44]}")
+    rs = out.rule_score
+    ms = out.ml_score
+    gs = out.graph_risk
+    bs = out.blended_score
+    if cr and cr.top_hit and cr.top_hit.all_rule_scores:
+        _div(".")
+        _row("  Rule chain scores:", "  Blend arithmetic:")
+        for code, score in cr.top_hit.all_rule_scores.items():
+            winner = " <-" if code == cr.top_hit.rule_code else ""
+            ltext  = f"  {code} {_RULE_LABELS.get(code, ''):<18} {score:.3f} [{_bar(score)}]{winner}"
+            _row(ltext, "")
+    _div(".")
+    _row(f"  Rule score  : {rs:.4f}",
+         f"  Rule  {rs:.4f} x 0.50 = {rs*0.50:.4f}")
+    ml_str = f"{ms:.4f} x 0.30 = {ms*0.30:.4f}" if ms is not None else "N/A (no hit)"
+    gs_str = f"{gs:.4f} x 0.20 = {gs*0.20:.4f}" if gs is not None else "N/A (no hit)"
+    _row("  ML score    : not computed",  f"  ML    {ml_str}")
+    _row("  Graph risk  : not computed",  f"  Graph {gs_str}")
+    _div("-")
+    _row(f"  FINAL SCORE : {rs:.4f}  (rule only)",
+         f"  FINAL SCORE : {bs:.4f}  (blended)")
+    _div("-")
+    rule_dec = apply_threshold(rs, out.job_code).decision
+    _row(f"  DECISION : {_dec(rule_dec, rs)}",
+         f"  DECISION : {_dec(out.overall_decision, bs)}")
+    if out.fp_flag:
+        _div("!")
+        print(_col("  [!] POSSIBLE FALSE POSITIVE", YEL))
+        for part in out.fp_reason.split(";"):
+            p = part.strip()
+            if p: print(_col(f"      * {p}", YEL))
+        print(_col("  Recommend manual review before raising an alert.", YEL))
+    if rule_dec != out.overall_decision:
+        _div("!")
+        diff = bs - rs
+        direction = f"UP +{diff:.4f}" if diff > 0 else f"DOWN {diff:.4f}"
+        print(_col(f"  [!] INTEGRATION CHANGED DECISION: {rule_dec} -> {out.overall_decision}  ({direction})", YEL))
+    _row(f"  Latency : {out.latency_ms:.1f} ms", f"  Latency : {out.latency_ms:.1f} ms (shared)")
+
+
+def print_batch_summary(outputs, watchlist):
+    from policy_engine.thresholds import apply_threshold
+    bar = "=" * 108
+    print(f"\n{bar}")
+    print(f"  BATCH SUMMARY  [{watchlist}]")
+    print(bar)
+    print(f"  {'#':<3} {'Name':<28} {'Rule':>7} {'Rule Dec':<10} {'Blended':>8} {'Int Dec':<10} {'Changed':<8} {'FP?'}")
+    print(f"  {'-'*103}")
+    for i, out in enumerate(outputs, 1):
+        rs       = out.rule_score
+        bs       = out.blended_score
+        rule_dec = apply_threshold(rs, out.job_code).decision
+        int_dec  = out.overall_decision
+        cr       = RED if rule_dec == "ALERT" else YEL if rule_dec == "REVIEW" else GRN
+        ci       = RED if int_dec  == "ALERT" else YEL if int_dec  == "REVIEW" else GRN
+        chg      = _col("YES", YEL) if rule_dec != int_dec else "   "
+        fp       = _col("[!]", YEL) if out.fp_flag else "   "
+        print(f"  {i:<3} {out.input.name[:28]:<28} {rs:>7.4f} {_col(rule_dec,cr):<10} {bs:>8.4f} {_col(int_dec,ci):<10} {chg}  {fp}")
+    print()
+    n    = len(outputs)
+    from policy_engine.thresholds import apply_threshold as at
+    r_al = sum(1 for o in outputs if at(o.rule_score,  o.job_code).decision == "ALERT")
+    i_al = sum(1 for o in outputs if o.overall_decision == "ALERT")
+    chg  = sum(1 for o in outputs if at(o.rule_score, o.job_code).decision != o.overall_decision)
+    fpc  = sum(1 for o in outputs if o.fp_flag)
+    print(f"  Total screened         : {n}")
+    print(f"  Rule-only  ALERTS      : {r_al} ({r_al/max(n,1)*100:.0f}%)")
+    print(f"  Integrated ALERTS      : {i_al} ({i_al/max(n,1)*100:.0f}%)")
+    print(f"  Decisions changed      : {chg}")
+    print(f"  Possible false pos [!] : {fpc}")
+    print(bar)
+
+
+def print_model_report(model):
+    m = model.cv_metrics
+    if not m:
+        print("  No metrics available."); return
+    bar = "=" * 65
+    print(f"\n{bar}"); print("  ML MODEL ACCURACY REPORT"); print(bar)
+    print(f"\n  Training data")
+    print(f"    Total samples : {m['n_samples']}")
+    print(f"    Positives     : {m['n_pos']}")
+    print(f"    Negatives     : {m['n_neg']}")
+    print(f"    Evaluation    : 5-fold stratified cross-validation\n")
+    print(f"  {'Metric':<32} {'Mean':>8}  {'Std':>8}")
+    print(f"  {'-'*50}")
+    print(f"  {'ROC-AUC':<32} {m['cv_roc_auc']:>8.4f}  +/-{m['cv_roc_std']:.4f}")
+    print(f"  {'PR-AUC (avg precision)':<32} {m['cv_pr_auc']:>8.4f}")
+    print(f"  {'F1 Score':<32} {m['cv_f1']:>8.4f}")
+    print(f"  {'Precision':<32} {m['cv_precision']:>8.4f}")
+    print(f"  {'Recall':<32} {m['cv_recall']:>8.4f}")
+    print(f"\n  Train-set ROC-AUC : {m['train_auc']:.4f}  (upper bound only)")
+    cm = m["cm"]
+    tn, fp, fn, tp = cm[0][0], cm[0][1], cm[1][0], cm[1][1]
+    total = tn + fp + fn + tp
+    print(f"\n  Confusion Matrix (train set)")
+    print(f"                    Predicted CLEAR   Predicted ALERT")
+    print(f"  Actual CLEAR      {tn:>15}   {fp:>15}")
+    print(f"  Actual ALERT      {fn:>15}   {tp:>15}")
+    print(f"\n  Accuracy = {(tp+tn)/total:.4f}  |  FPR = {fp/(fp+tn+1e-9):.4f}  |  FDR = {fp/(tp+fp+1e-9):.4f}")
+    print(f"\n  Classification Report\n")
+    print(textwrap.indent(m["cls_report"], "  "))
+    print("  Top 5 Feature Importances")
+    for fname, fval in sorted(m["feature_importances"].items(), key=lambda x: -x[1])[:5]:
+        print(f"    {fname:<32} {fval:.4f}  [{_bar(min(fval*3,1.0), 16)}]")
+    roc = m["cv_roc_auc"]
+    msg = ("Excellent" if roc>=0.95 else "Good" if roc>=0.85 else "Fair" if roc>=0.70 else "Weak")
+    print(f"\n  Interpretation: ROC-AUC {roc:.2f}: {msg}")
+    print(f"\n  NOTE: Metrics on synthetic data. See REAL_DATA_INTEGRATION.md.")
+    print(f"\n{bar}\n")
+
+
+def list_watchlists(registry):
+    print(f"\n{'='*55}"); print("  Available watchlists"); print(f"{'='*55}")
+    print(f"  {'Dataset':<25} {'Entity Type':<14} {'Records':>8}")
+    print(f"  {'-'*50}")
+    for code, etype, count in registry.list_partitions():
+        print(f"  {code:<25} {etype:<14} {count:>8,}")
+    print(f"{'='*55}")
+    print('\n  Example:')
+    print('    python -m cli.screen_targeted --name "Ali Hassan" --watchlist OFAC_SDN')
+    print('    python -m cli.screen_targeted --name "Tehran Co" --watchlist UN_CONSOLIDATED --entity-type ENTITY\n')
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AML Targeted Screener - one watchlist, full ML+graph side-by-side",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    grp = parser.add_mutually_exclusive_group()
+    grp.add_argument("--name",  help="Single name to screen")
+    grp.add_argument("--names", help="Comma-separated names")
+    grp.add_argument("--csv",   help="CSV (columns: name, watchlist, entity_type, country, dob)")
+    parser.add_argument("--watchlist",    default="OFAC_SDN")
+    parser.add_argument("--entity-type",  default="INDIVIDUAL", dest="entity_type")
+    parser.add_argument("--country",      default="")
+    parser.add_argument("--dob",          default="")
+    parser.add_argument("--id-number",    default="", dest="id_number")
+    parser.add_argument("--job",          default=None, help="Override: SAN|PEP|SCION|NNS")
+    parser.add_argument("--model-report", action="store_true")
+    parser.add_argument("--list-watchlists", action="store_true", dest="list_watchlists")
+    parser.add_argument("--quiet",        action="store_true")
+    args = parser.parse_args()
+
+    if args.list_watchlists:
+        from data_layer.registry.dataset_registry import DatasetRegistry
+        list_watchlists(DatasetRegistry().load_all(verbose=False))
+        sys.exit(0)
+
+    if not args.name and not args.names and not args.csv:
+        print("\n  No name provided.  Example:")
+        print('    python -m cli.screen_targeted --name "Mohammed Ali Hassan"')
+        print('    python -m cli.screen_targeted --name "Ali Hassan" --watchlist PEP_DATABASE')
+        print("\n  Use --list-watchlists to see all datasets.\n")
+        sys.exit(0)
+
+    entity_type = args.entity_type.strip().upper()
+    watchlist   = args.watchlist.strip().upper()
+
+    orch, model, _jc = build_infrastructure(watchlist, entity_type, verbose=not args.quiet)
+
+    from orchestration.orchestrator import ScreeningInput
+
+    def _jt(wl):
+        if args.job: return args.job.upper()
+        return _DATASET_JOB.get(wl.upper(), "SAN")
+
+    persons = []
+
+    if args.name:
+        persons.append(ScreeningInput(
+            name=args.name, country=args.country, dob=args.dob,
+            entity_type=entity_type, job_type=_jt(watchlist),
+            id_number=args.id_number,
+        ))
+    elif args.names:
+        for n in args.names.split(","):
+            n = n.strip()
+            if n:
+                persons.append(ScreeningInput(
+                    name=n, country=args.country, dob=args.dob,
+                    entity_type=entity_type, job_type=_jt(watchlist),
+                ))
+    elif args.csv:
+        if not os.path.isfile(args.csv):
+            print(f"ERROR: CSV not found: {args.csv}"); sys.exit(1)
+        df_in = pd.read_csv(args.csv)
+        df_in.columns = [c.lower().strip() for c in df_in.columns]
+        for _, row in df_in.iterrows():
+            rw = str(row.get("watchlist", watchlist)).strip().upper()
+            persons.append(ScreeningInput(
+                name=        str(row.get("name", "")),
+                country=     str(row.get("country",     args.country)),
+                dob=         str(row.get("dob",         args.dob)),
+                entity_type= str(row.get("entity_type", entity_type)).upper(),
+                job_type=    _jt(rw),
+                id_number=   str(row.get("id_number",   "")),
+            ))
+        if not args.quiet: print(f"  Loaded {len(persons)} persons from {args.csv}\n")
+
+    if not persons:
+        print("No persons to screen."); sys.exit(0)
+
+    outputs = []
+    for i, inp in enumerate(persons, 1):
+        out = orch.screen_integrated(inp)
+        print_comparison(out, i, len(persons), watchlist)
+        outputs.append(out)
+
+    if len(outputs) > 1:
+        print_batch_summary(outputs, watchlist)
+
+    if args.model_report:
+        print_model_report(model)
+
+
+if __name__ == "__main__":
+    main()
