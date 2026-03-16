@@ -1,0 +1,557 @@
+"""
+matching_engine/rules/atomic_rules.py
+═══════════════════════════════════════
+OWS-aligned atomic (discrete, named) match rule functions.
+
+Each function is independently callable, independently reportable, and
+independently togglable via rule_config.py.  They map to OWS rule codes:
+
+  ORIGINAL (I010O – I080O)
+  ─────────────────────────
+  I010O  Exact name match
+  I020O  Fuzzy composite match  (token_sort + token_set + partial + jaro-winkler)
+  I030O  Reversed token order
+  I040O  Given name / family name split match
+  I050O  Abbreviated given name  (e.g. "M. ALI" → "MOHAMMED ALI")
+  I060O  Phonetic match          (double-metaphone per token)
+  I070O  Transliteration match   (Arabic / Cyrillic / CJK variants)
+  I080O  DOB cluster             (name must reach minimum band + DOB corroborates)
+
+  NEW (I090O – I190O)
+  ─────────────────────────
+  I090O  National ID / Passport match
+  I100O  Character N-gram match        (trigram Jaccard on name characters)
+  I110O  Gender corroboration          (boost/penalise based on gender field)
+  I120O  Place of birth corroboration  (country match boosts name score)
+  I130O  Legal entity suffix normalise (strip LTD/LLC etc. before comparing)
+  I140O  Trading name / DBA match      (acronym + first-word match)
+  I150O  Character substitution (leet) (0→O, 1→I, Cyrillic homoglyphs)
+  I160O  Name particle permutation     (AL/BIN/VAN stripped + permuted)
+  I170O  DOB transposition / approx    (day-month swap, ±1 year calendar drift)
+  I180O  Deceased suppression          (post-score penalty, not standalone)
+  I190O  Linked entity propagation     (graph-layer hook — see graph_engine)
+
+All functions return a float in [0.0, 1.0].
+0.0 means the rule did not fire / produced no match.
+"""
+from __future__ import annotations
+
+# ── optional rapid-fuzz ────────────────────────────────────────────────────
+try:
+    from rapidfuzz import fuzz, distance as _rfdist
+    _RAPIDFUZZ = True
+except ImportError:
+    _RAPIDFUZZ = False
+    fuzz = None
+    _rfdist = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Internal helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _prep(s: str) -> str:
+    return s.upper().strip()
+
+
+def _stdlib_fuzzy(a: str, b: str) -> float:
+    """
+    Proper stdlib fallback for when rapidfuzz is not installed.
+
+    Uses three measures then takes a weighted average:
+      1. SequenceMatcher ratio         — character-level similarity (35 %)
+      2. Token sort ratio              — sorted token overlap (35 %)
+      3. Token Jaccard on whole tokens — exact-token overlap (30 %)
+
+    This replaces the old  `if a in b: return 0.75`  which caused false
+    positives: e.g. "HASSAN" in "AL-HASSAN" → 0.75, so screening
+    "Mohammed Ali Hassan" against "Walid Khadija Al-Hassan" would fire.
+    """
+    import difflib
+
+    if a == b:
+        return 1.0
+
+    # 1. Sequence ratio
+    seq = difflib.SequenceMatcher(None, a, b).ratio()
+
+    # 2. Token-sort ratio (sort tokens alphabetically then compare)
+    a_sorted = " ".join(sorted(a.split()))
+    b_sorted = " ".join(sorted(b.split()))
+    tok_sort = difflib.SequenceMatcher(None, a_sorted, b_sorted).ratio()
+
+    # 3. Token Jaccard (exact whole-word overlap)
+    a_toks = set(a.split())
+    b_toks = set(b.split())
+    union   = a_toks | b_toks
+    jaccard = len(a_toks & b_toks) / len(union) if union else 0.0
+
+    score = 0.35 * seq + 0.35 * tok_sort + 0.30 * jaccard
+    return round(score, 4)
+
+
+def _fuzzy_composite(a: str, b: str) -> float:
+    """
+    Core 4-algorithm composite score used by I020O, I030O, I040O, I050O.
+    Weights: token_sort 30 % | token_set 30 % | partial 20 % | jaro-winkler 20 %
+    """
+    a, b = _prep(a), _prep(b)
+    if not a or not b:
+        return 0.0
+    if not _RAPIDFUZZ:
+        return _stdlib_fuzzy(a, b)
+    ts  = fuzz.token_sort_ratio(a, b)  / 100.0
+    tse = fuzz.token_set_ratio(a, b)   / 100.0
+    pr  = fuzz.partial_ratio(a, b)     / 100.0
+    jw  = _rfdist.JaroWinkler.normalized_similarity(a, b)
+    return round(0.30*ts + 0.30*tse + 0.20*pr + 0.20*jw, 4)
+
+
+def _dob_match_level(dob_inp: str, dob_cand: str) -> int:
+    """
+    Return DOB match granularity:
+      0 = no match / missing
+      1 = year only
+      2 = year + month
+      3 = exact (year + month + day)
+    """
+    d1, d2 = str(dob_inp).strip(), str(dob_cand).strip()
+    if not d1 or not d2:
+        return 0
+    if d1[:4] != d2[:4] or not d1[:4].isdigit():
+        return 0
+    if len(d1) >= 7 and len(d2) >= 7 and d1[:7] == d2[:7]:
+        if d1 == d2:
+            return 3
+        return 2
+    return 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I010O]  Exact name match
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I010O_exact(inp_name: str, cand_name: str) -> float:
+    """
+    Returns 1.0 only when the normalised strings are character-for-character
+    identical.  Any deviation returns 0.0.
+    """
+    a, b = _prep(inp_name), _prep(cand_name)
+    return 1.0 if (a and b and a == b) else 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I020O]  Fuzzy composite match
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I020O_fuzzy(inp_name: str, cand_name: str) -> float:
+    """
+    Standard weighted fuzzy composite.  This is what the legacy _composite()
+    function computed — now surfaced as a named, auditable rule.
+    """
+    return _fuzzy_composite(inp_name, cand_name)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I030O]  Reversed token order
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I030O_reversed(inp_name: str, cand_name: str) -> float:
+    """
+    "HUSSEIN MOHAMMED" matching "MOHAMMED HUSSEIN".
+
+    Sorts both token lists alphabetically, then runs the fuzzy composite on
+    the sorted strings.  Returns 0.0 if the result is no better than the
+    direct composite (i.e. the reversal was not the key factor).
+
+    A slight confidence penalty of 0.97× is applied because reversed-order
+    matches carry marginally less certainty than canonical-order matches.
+    """
+    a_toks = sorted(_prep(inp_name).split())
+    b_toks = sorted(_prep(cand_name).split())
+    if not a_toks or not b_toks:
+        return 0.0
+    s_sorted  = _fuzzy_composite(" ".join(a_toks), " ".join(b_toks))
+    s_direct  = _fuzzy_composite(inp_name, cand_name)
+    if s_sorted > s_direct:
+        return round(s_sorted * 0.97, 4)
+    return s_direct
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I040O]  Given name / family name split match
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _split_name(full: str) -> tuple[str, str]:
+    """
+    Split 'JOHN MICHAEL SMITH' → given='JOHN MICHAEL', family='SMITH'.
+    Single-token name → given='', family=token.
+    """
+    toks = _prep(full).split()
+    if len(toks) == 0:
+        return "", ""
+    if len(toks) == 1:
+        return "", toks[0]
+    return " ".join(toks[:-1]), toks[-1]
+
+
+def rule_I040O_given_family(
+    inp_name: str,
+    cand_name: str,
+    inp_given: str = "",
+    inp_family: str = "",
+    cand_given: str = "",
+    cand_family: str = "",
+) -> float:
+    """
+    Match given name and family name as separate fields.
+
+    If explicit split fields are supplied (inp_given / inp_family / cand_given /
+    cand_family) those are used directly; otherwise the full name strings are
+    auto-split on the last token.
+
+    Family name is weighted higher (60 %) than given name (40 %) because family
+    names are more discriminating in sanctions lists.
+    """
+    ig = _prep(inp_given)  or _split_name(inp_name)[0]
+    if_= _prep(inp_family) or _split_name(inp_name)[1]
+    cg = _prep(cand_given) or _split_name(cand_name)[0]
+    cf = _prep(cand_family)or _split_name(cand_name)[1]
+
+    if not if_ or not cf:
+        return 0.0
+
+    f_score = _fuzzy_composite(if_, cf)
+    g_score = _fuzzy_composite(ig, cg) if (ig and cg) else f_score
+
+    return round(0.40 * g_score + 0.60 * f_score, 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I050O]  Abbreviated given name
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I050O_abbreviated(inp_name: str, cand_name: str) -> float:
+    """
+    Detects when the query contains an initial ("M. ALI", "J SMITH") and checks
+    whether the initial matches the first letter of the corresponding token in
+    the candidate, then scores the remainder of the name normally.
+
+    Rules:
+      • First token of INPUT must be 1 character (+ optional period).
+      • That character must match the first character of the first token of CAND.
+      • The remaining tokens are scored by fuzzy composite.
+      • A small confidence penalty (0.90×) is applied for abbreviated evidence.
+
+    Returns 0.0 if the first token is not an initial.
+    """
+    inp_toks = _prep(inp_name).split()
+    cnd_toks = _prep(cand_name).split()
+    if not inp_toks or not cnd_toks:
+        return 0.0
+
+    initial = inp_toks[0].rstrip(".")
+    if len(initial) != 1:
+        return 0.0                          # not an initial
+
+    if not cnd_toks[0].startswith(initial):
+        return 0.0                          # initial doesn't match
+
+    inp_rest = " ".join(inp_toks[1:])
+    cnd_rest = " ".join(cnd_toks[1:])
+
+    if not inp_rest:
+        # Only an initial was provided — weak match on initial alone
+        return round(0.60, 4)
+
+    rest_score = _fuzzy_composite(inp_rest, cnd_rest) if cnd_rest else 0.0
+    return round(rest_score * 0.90, 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I060O]  Phonetic match (Double Metaphone per token)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _metaphone_codes(token: str) -> set[str]:
+    """Return the set of non-empty double-metaphone codes for a token."""
+    try:
+        from metaphone import doublemetaphone  # type: ignore
+        return {c for c in doublemetaphone(token) if c}
+    except ImportError:
+        return set()
+
+
+def rule_I060O_phonetic(inp_name: str, cand_name: str) -> float:
+    """
+    Token-level Double Metaphone phonetic matching.
+
+    For each token in the input, check whether any candidate token shares a
+    metaphone code.  The proportion of matching token pairs drives the score.
+
+    Confidence cap: 0.82 — phonetic evidence is weaker than string evidence.
+    Returns 0.0 gracefully when the `metaphone` library is not installed.
+    """
+    inp_toks = _prep(inp_name).split()
+    cnd_toks = _prep(cand_name).split()
+    if not inp_toks or not cnd_toks:
+        return 0.0
+
+    # Guard: if metaphone is not available, return 0.0 silently
+    try:
+        from metaphone import doublemetaphone  # noqa: F401 — just check import
+    except ImportError:
+        return 0.0
+
+    matched = 0
+    for it in inp_toks:
+        ic = _metaphone_codes(it)
+        if not ic:
+            continue
+        for ct in cnd_toks:
+            if ic & _metaphone_codes(ct):
+                matched += 1
+                break
+
+    if matched == 0:
+        return 0.0
+
+    ratio = matched / max(len(inp_toks), len(cnd_toks))
+    return round(min(0.82, ratio * 0.82), 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I070O]  Transliteration match
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I070O_transliteration(inp_name: str, cand_name: str) -> float:
+    """
+    Generate romanised / transliterated variants of both names via the existing
+    transliteration_engine, then take the best composite score across all
+    (input-variant × candidate-variant) pairs.
+
+    The existing engine covers Arabic, Cyrillic, Persian, and CJK tokens via
+    static maps plus the optional `transliterate` library.
+
+    A confidence cap of 0.90 is applied — transliteration matches carry some
+    ambiguity compared to direct string matches.
+    """
+    try:
+        from data_layer.utils.transliteration_engine import transliterate
+    except ImportError:
+        return 0.0
+
+    inp_upper = _prep(inp_name)
+    cnd_upper = _prep(cand_name)
+
+    inp_variants = [inp_upper] + [_prep(v) for v in transliterate(inp_upper)]
+    cnd_variants = [cnd_upper] + [_prep(v) for v in transliterate(cnd_upper)]
+
+    best = 0.0
+    for iv in inp_variants:
+        for cv in cnd_variants:
+            if not iv or not cv:
+                continue
+            s = _fuzzy_composite(iv, cv)
+            if s > best:
+                best = s
+                if best >= 1.0:
+                    return 1.0  # short-circuit on perfect match
+
+    return round(min(0.90, best), 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I080O]  DOB cluster (name + DOB together as a distinct rule)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# DOB boost values per match granularity
+_DOB_BOOST = {1: 0.05, 2: 0.08, 3: 0.12}
+
+# Minimum name score required for DOB to "activate" this cluster rule
+_DOB_CLUSTER_MIN_NAME = 0.45
+
+
+def rule_I080O_dob_cluster(
+    inp_name: str,
+    cand_name: str,
+    inp_dob: str,
+    cand_dob: str,
+) -> float:
+    """
+    Name + DOB corroboration cluster rule.
+
+    This is NOT simply a boost on top of another rule.  It fires as a distinct
+    named rule when BOTH conditions hold:
+      1. Name score reaches the minimum cluster threshold (0.45)
+      2. DOB matches at year level or better
+
+    Output = min(1.0, name_score + dob_boost)
+
+    If either condition fails, returns 0.0 — the rule does not fire.
+    """
+    level = _dob_match_level(inp_dob, cand_dob)
+    if level == 0:
+        return 0.0
+
+    name_score = _fuzzy_composite(inp_name, cand_name)
+    if name_score < _DOB_CLUSTER_MIN_NAME:
+        return 0.0
+
+    boost = _DOB_BOOST[level]
+    return round(min(1.0, name_score + boost), 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ──────────────────────────  NEW RULES  ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I090O]  National ID / Passport match
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I090O_id_match(inp_id: str, cand_id: str) -> float:
+    """
+    Compare identifier numbers directly (passport, national ID, registration
+    number, tax number).
+
+    Scoring:
+      • Full normalised exact match                     → 1.0
+      • First 6+ characters match (passport prefix)    → 0.85
+      • No match                                        → 0.0
+
+    Why 0.85 for prefix:  passport numbers of the same country share a
+    country/series prefix.  A prefix match alone is weak but real — it means
+    the person is from the same issuing country and series, which adds weight
+    alongside a name match.
+
+    This rule is intentionally strict: an ID is a hard identifier and a
+    close-but-not-exact ID match is more suspicious than helpful.
+    """
+    a = _prep(str(inp_id)).replace("-", "").replace(" ", "")
+    b = _prep(str(cand_id)).replace("-", "").replace(" ", "")
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    # Prefix match (at least 6 characters)
+    prefix_len = min(len(a), len(b), 6)
+    if prefix_len >= 6 and a[:prefix_len] == b[:prefix_len]:
+        return 0.85
+    return 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I100O]  Character N-gram match
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I100O_ngram(inp_name: str, cand_name: str, n: int = 3) -> float:
+    """
+    Trigram (character-level) Jaccard similarity on the full name string
+    with spaces removed.
+
+    Why this complements I020O:
+      I020O operates on tokens (words).  I100O operates on characters.
+      It catches deliberate single-character insertions / deletions that
+      fool token-level rules:
+        "MUHAMMED"  vs "MOHAMAD"  — character overlap is high even though
+        token-sort would produce a mediocre score on these two spellings.
+
+    Cap: 0.88 — character overlap alone is weaker than full-word match.
+
+    Example:
+        "HASSAN" trigrams: {HAS, ASS, SSA, SAN}  (4)
+        "HASAN"  trigrams: {HAS, ASA, SAN}        (3)
+        intersection = {HAS, SAN} = 2
+        union        = 5
+        Jaccard = 2/5 = 0.40  →  useful signal, not a false positive
+    """
+    a = _prep(inp_name).replace(" ", "")
+    b = _prep(cand_name).replace(" ", "")
+    if len(a) < n or len(b) < n:
+        return 0.0
+
+    a_grams = {a[i:i+n] for i in range(len(a) - n + 1)}
+    b_grams = {b[i:i+n] for i in range(len(b) - n + 1)}
+    union = a_grams | b_grams
+    if not union:
+        return 0.0
+
+    jaccard = len(a_grams & b_grams) / len(union)
+    return round(min(0.88, jaccard), 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I110O]  Gender corroboration
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I110O_gender(
+    inp_name: str,
+    cand_name: str,
+    inp_gender: str,
+    cand_gender: str,
+) -> float:
+    """
+    Modifies the base name score based on gender agreement.
+
+    This is a CORROBORATION rule, not a standalone rule.  It takes the
+    fuzzy composite name score and adjusts it:
+      • Both genders known AND match   → score × 1.05  (small boost, capped at 1.0)
+      • Both genders known AND mismatch → score × 0.70  (significant penalty)
+      • Either gender unknown/missing  → score unchanged (pass-through)
+
+    Why 0.70 penalty not 0.0:  A gender mismatch reduces confidence but
+    does not eliminate the match — data entry errors are common, and some
+    names are gender-neutral across cultures.
+
+    Returns the adjusted name score in [0.0, 1.0].
+    """
+    base = _fuzzy_composite(inp_name, cand_name)
+    ig = _prep(str(inp_gender))
+    cg = _prep(str(cand_gender))
+
+    _UNKNOWN = {"", "UNKNOWN", "U", "OTHER", "UNSPECIFIED", "NAN", "NONE"}
+    if ig in _UNKNOWN or cg in _UNKNOWN:
+        return base   # can't corroborate — return base score unchanged
+
+    # Normalise M/F variants
+    _MALE   = {"M", "MALE", "MAN"}
+    _FEMALE = {"F", "FEMALE", "WOMAN", "W"}
+    ig_m = ig in _MALE;   ig_f = ig in _FEMALE
+    cg_m = cg in _MALE;   cg_f = cg in _FEMALE
+
+    if (ig_m and cg_m) or (ig_f and cg_f):
+        return round(min(1.0, base * 1.05), 4)   # match — small boost
+    if (ig_m and cg_f) or (ig_f and cg_m):
+        return round(base * 0.70, 4)              # mismatch — penalty
+    return base  # unrecognised gender codes — pass through
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [I120O]  Place of birth / nationality corroboration
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_I120O_place_of_birth(
+    inp_name: str,
+    cand_name: str,
+    inp_country: str,
+    cand_nationality: str,
+) -> float:
+    """
+    Boosts the name score when the input country matches the candidate's
+    nationality.  Does NOT penalise on mismatch — a country mismatch
+    could mean the person has dual nationality or has relocated.
+
+    Boost: +0.06 on top of base name score when countries match.
+    Cap: 1.0.
+
+    Returns 0.0 if either country is empty/unknown — this rule only fires
+    when corroborating evidence is actually available.
+    """
+    base = _fuzzy_composite(inp_name, cand_name)
+    ic = _prep(str(inp_country))
+    cc = _prep(str(cand_nationality))
+
+    _UNKNOWN = {"", "UNKNOWN", "N/A", "NAN", "NONE"}
+    if ic in _UNKNOWN or cc in _UNKNOWN:
+        return 0.0 
