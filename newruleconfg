@@ -1,0 +1,323 @@
+"""
+config/rule_config.py
+══════════════════════
+Per-job rule enable/disable configuration.
+Equivalent to OWS Run Profile properties:
+  phase.*.process.*.[I010O] Exact name only.san_rule_enabled = true/false
+
+Each job code maps to a RuleConfig object whose .enabled(key) method
+tells the RuleChain whether to execute a given atomic rule.
+
+ORIGINAL rules (I010O – I080O) — unchanged defaults
+─────────────────────────────────────────────────────
+  • Exact + Fuzzy + Reversed + Given/Family + Abbreviated + Transliteration
+    are ON for all name-match jobs.
+  • Phonetic (I060O) is OFF for SAN/SCION (high false-positive rate on
+    sanction names) but ON for PEP/NNS jobs (higher sensitivity acceptable).
+  • DOB cluster (I080O) is ON only for INDIVIDUAL jobs that carry a DOB field.
+  • NNS jobs disable DOB cluster (NNS records don't carry DOB).
+
+NEW rules (I090O – I180O) — added defaults and per-job overrides
+──────────────────────────────────────────────────────────────────
+  I090O  ID/Passport match:
+         ON for IND jobs that carry id_number (SAN_IND, SCION_IND, PEP_IND).
+         OFF for ENT jobs (entities use registration_number differently).
+         OFF for NNS (news articles don't carry ID numbers).
+
+  I100O  N-gram character match:
+         ON for all name-matching jobs.
+         Adds meaningful signal for short/variant spellings.
+
+  I110O  Gender corroboration:
+         ON for IND jobs only.
+         OFF for all ENT and CTRY jobs.
+
+  I120O  Place of birth corroboration:
+         ON for all IND jobs.
+         Optional for ENT jobs (entity nationality is less reliable).
+
+  I130O  Legal entity suffix normalisation:
+         ON for ENT jobs only (SAN_ENT, SCION_ENT, PEP_ENT, NNS_ENT).
+         OFF for all IND jobs.
+
+  I140O  Trading name / DBA match:
+         ON for ENT jobs only.
+         OFF for all IND jobs.
+
+  I150O  Character substitution (leet/homoglyph):
+         ON for all name-matching jobs.
+         Zero false-positive risk — only fires when substitution
+         materially changes the score.
+
+  I160O  Name particle permutation (AL/BIN/VAN):
+         ON for IND jobs where Arabic / Middle Eastern names are common.
+         OFF for ENT jobs (particles less relevant for entity names).
+
+  I170O  DOB transposition / approximate:
+         ON for IND jobs that carry DOB data.
+         OFF for ENT jobs and NNS.
+
+  I180O  Deceased suppression (post-score modifier):
+         ON for all IND jobs.
+         OFF for ENT jobs and CTRY.
+
+To change flags at runtime:
+    from config.rule_config import get_rule_config
+    cfg = get_rule_config("SAN_IND")
+    cfg.set("I060O_PHONETIC", True)
+    cfg.set("I160O_PARTICLE_PERM", False)
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict
+
+
+# ── Default ON/OFF for every rule key ─────────────────────────────────────
+_DEFAULTS: Dict[str, bool] = {
+    # ── Original 8 rules ──────────────────────────────────────────────────
+    "I010O_EXACT":           True,
+    "I020O_FUZZY":           True,
+    "I030O_REVERSED":        True,
+    "I040O_GIVEN_FAMILY":    True,
+    "I050O_ABBREVIATED":     True,
+    "I060O_PHONETIC":        False,   # OFF by default — high FP rate
+    "I070O_TRANSLITERATION": True,
+    "I080O_DOB_CLUSTER":     True,
+    # ── New rules — individual-oriented (ON by default for IND jobs) ───────
+    "I090O_ID_MATCH":        True,    # ON — ID match is high value
+    "I100O_NGRAM":           True,    # ON — low FP risk, good for variants
+    "I110O_GENDER":          True,    # ON — reduces FP when gender known
+    "I120O_PLACE_OF_BIRTH":  True,    # ON — country corroboration
+    # ── New rules — entity-oriented (OFF by default, ON in ENT jobs) ──────
+    "I130O_SUFFIX_NORM":     False,   # OFF by default — entity jobs override
+    "I140O_TRADING_NAME":    False,   # OFF by default — entity jobs override
+    # ── New rules — evasion detection (ON by default for all) ─────────────
+    "I150O_CHAR_SUBST":      True,    # ON — no FP risk, catches leet-speak
+    "I160O_PARTICLE_PERM":   True,    # ON — Arabic/Dutch name handling
+    "I170O_DOB_APPROX":      True,    # ON — catches day/month swaps
+    # ── Post-score modifier ────────────────────────────────────────────────
+    "I180O_DECEASED_SUPPRESSION": True,  # ON — deceased records get penalty
+}
+
+
+@dataclass
+class RuleConfig:
+    """
+    Holds rule flags for a single job.  Inherits from defaults; overrides
+    are applied per-job below.
+    """
+    job_code: str
+    _flags: Dict[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Start from defaults, then apply any job-specific overrides
+        merged = dict(_DEFAULTS)
+        merged.update(self._flags)
+        self._flags = merged
+
+    def enabled(self, key: str) -> bool:
+        """Return True if the rule identified by `key` is enabled for this job."""
+        return self._flags.get(key, True)
+
+    def set(self, key: str, value: bool) -> None:
+        """Override a rule flag at runtime (e.g. for A/B testing)."""
+        self._flags[key] = value
+
+    def as_dict(self) -> Dict[str, bool]:
+        """Return a copy of all flags."""
+        return dict(self._flags)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Per-job configurations
+# ══════════════════════════════════════════════════════════════════════════════
+
+_JOB_CONFIGS: Dict[str, RuleConfig] = {
+
+    # ── SAN_IND ───────────────────────────────────────────────────────────
+    # Sanctions Individual: strict name + DOB, phonetic OFF (high FP),
+    # ID match ON, suffix/DBA OFF (individual not entity)
+    "SAN_IND": RuleConfig(
+        job_code="SAN_IND",
+        _flags={
+            "I060O_PHONETIC":            False,
+            "I080O_DOB_CLUSTER":         True,
+            "I090O_ID_MATCH":            True,    # passport / national ID
+            "I100O_NGRAM":               True,
+            "I110O_GENDER":              True,
+            "I120O_PLACE_OF_BIRTH":      True,
+            "I130O_SUFFIX_NORM":         False,   # individual — no entity suffix
+            "I140O_TRADING_NAME":        False,   # individual — no DBA
+            "I150O_CHAR_SUBST":          True,
+            "I160O_PARTICLE_PERM":       True,    # Arabic name handling
+            "I170O_DOB_APPROX":          True,
+            "I180O_DECEASED_SUPPRESSION":True,
+        },
+    ),
+
+    # ── SAN_ENT ───────────────────────────────────────────────────────────
+    # Sanctions Entity: no DOB/gender/ID (entities), suffix + DBA ON
+    "SAN_ENT": RuleConfig(
+        job_code="SAN_ENT",
+        _flags={
+            "I060O_PHONETIC":            False,
+            "I080O_DOB_CLUSTER":         False,   # entities have no DOB
+            "I090O_ID_MATCH":            False,   # individual IDs not relevant
+            "I100O_NGRAM":               True,
+            "I110O_GENDER":              False,   # entities have no gender
+            "I120O_PLACE_OF_BIRTH":      False,   # entity nationality unreliable
+            "I130O_SUFFIX_NORM":         True,    # LTD vs LLC vs CORP
+            "I140O_TRADING_NAME":        True,    # DBA evasion
+            "I150O_CHAR_SUBST":          True,
+            "I160O_PARTICLE_PERM":       False,   # particles in entity names rare
+            "I170O_DOB_APPROX":          False,
+            "I180O_DECEASED_SUPPRESSION":False,   # entities don't die
+        },
+    ),
+
+    # ── SCION_IND ─────────────────────────────────────────────────────────
+    "SCION_IND": RuleConfig(
+        job_code="SCION_IND",
+        _flags={
+            "I060O_PHONETIC":            False,
+            "I080O_DOB_CLUSTER":         True,
+            "I090O_ID_MATCH":            True,
+            "I100O_NGRAM":               True,
+            "I110O_GENDER":              True,
+            "I120O_PLACE_OF_BIRTH":      True,
+            "I130O_SUFFIX_NORM":         False,
+            "I140O_TRADING_NAME":        False,
+            "I150O_CHAR_SUBST":          True,
+            "I160O_PARTICLE_PERM":       True,
+            "I170O_DOB_APPROX":          True,
+            "I180O_DECEASED_SUPPRESSION":True,
+        },
+    ),
+
+    # ── SCION_ENT ─────────────────────────────────────────────────────────
+    "SCION_ENT": RuleConfig(
+        job_code="SCION_ENT",
+        _flags={
+            "I060O_PHONETIC":            False,
+            "I080O_DOB_CLUSTER":         False,
+            "I090O_ID_MATCH":            False,
+            "I100O_NGRAM":               True,
+            "I110O_GENDER":              False,
+            "I120O_PLACE_OF_BIRTH":      False,
+            "I130O_SUFFIX_NORM":         True,
+            "I140O_TRADING_NAME":        True,
+            "I150O_CHAR_SUBST":          True,
+            "I160O_PARTICLE_PERM":       False,
+            "I170O_DOB_APPROX":          False,
+            "I180O_DECEASED_SUPPRESSION":False,
+        },
+    ),
+
+    # ── PEP_IND ───────────────────────────────────────────────────────────
+    # PEP Individual: phonetic ON (higher sensitivity acceptable),
+    # DOB + ID + gender all ON
+    "PEP_IND": RuleConfig(
+        job_code="PEP_IND",
+        _flags={
+            "I060O_PHONETIC":            True,    # PEP jobs afford higher sensitivity
+            "I080O_DOB_CLUSTER":         True,
+            "I090O_ID_MATCH":            True,
+            "I100O_NGRAM":               True,
+            "I110O_GENDER":              True,
+            "I120O_PLACE_OF_BIRTH":      True,
+            "I130O_SUFFIX_NORM":         False,
+            "I140O_TRADING_NAME":        False,
+            "I150O_CHAR_SUBST":          True,
+            "I160O_PARTICLE_PERM":       True,
+            "I170O_DOB_APPROX":          True,
+            "I180O_DECEASED_SUPPRESSION":True,
+        },
+    ),
+
+    # ── PEP_ENT ───────────────────────────────────────────────────────────
+    "PEP_ENT": RuleConfig(
+        job_code="PEP_ENT",
+        _flags={
+            "I060O_PHONETIC":            True,
+            "I080O_DOB_CLUSTER":         False,
+            "I090O_ID_MATCH":            False,
+            "I100O_NGRAM":               True,
+            "I110O_GENDER":              False,
+            "I120O_PLACE_OF_BIRTH":      False,
+            "I130O_SUFFIX_NORM":         True,
+            "I140O_TRADING_NAME":        True,
+            "I150O_CHAR_SUBST":          True,
+            "I160O_PARTICLE_PERM":       False,
+            "I170O_DOB_APPROX":          False,
+            "I180O_DECEASED_SUPPRESSION":False,
+        },
+    ),
+
+    # ── NNS_IND ───────────────────────────────────────────────────────────
+    # Negative News Individual: phonetic ON, DOB cluster OFF (NNS lacks DOB),
+    # ID OFF (news articles don't carry ID numbers)
+    "NNS_IND": RuleConfig(
+        job_code="NNS_IND",
+        _flags={
+            "I060O_PHONETIC":            True,
+            "I080O_DOB_CLUSTER":         False,   # NNS records don't carry DOB
+            "I090O_ID_MATCH":            False,   # news articles don't carry IDs
+            "I100O_NGRAM":               True,
+            "I110O_GENDER":              False,   # NNS records rarely carry gender
+            "I120O_PLACE_OF_BIRTH":      True,    # country mentioned in articles
+            "I130O_SUFFIX_NORM":         False,
+            "I140O_TRADING_NAME":        False,
+            "I150O_CHAR_SUBST":          True,
+            "I160O_PARTICLE_PERM":       True,
+            "I170O_DOB_APPROX":          False,
+            "I180O_DECEASED_SUPPRESSION":True,
+        },
+    ),
+
+    # ── NNS_ENT ───────────────────────────────────────────────────────────
+    "NNS_ENT": RuleConfig(
+        job_code="NNS_ENT",
+        _flags={
+            "I060O_PHONETIC":            True,
+            "I080O_DOB_CLUSTER":         False,
+            "I090O_ID_MATCH":            False,
+            "I100O_NGRAM":               True,
+            "I110O_GENDER":              False,
+            "I120O_PLACE_OF_BIRTH":      False,
+            "I130O_SUFFIX_NORM":         True,
+            "I140O_TRADING_NAME":        True,
+            "I150O_CHAR_SUBST":          True,
+            "I160O_PARTICLE_PERM":       False,
+            "I170O_DOB_APPROX":          False,
+            "I180O_DECEASED_SUPPRESSION":False,
+        },
+    ),
+
+    # ── CTRY jobs ─────────────────────────────────────────────────────────
+    # Country jobs don't use name matching — all rules OFF
+    "CTRY_IND": RuleConfig(
+        job_code="CTRY_IND",
+        _flags={k: False for k in _DEFAULTS},
+    ),
+    "CTRY_ENT": RuleConfig(
+        job_code="CTRY_ENT",
+        _flags={k: False for k in _DEFAULTS},
+    ),
+}
+
+
+def get_rule_config(job_code: str) -> RuleConfig:
+    """
+    Return the RuleConfig for the given job_code.
+    Falls back to the default config (all defaults) for unknown job codes.
+    """
+    code = job_code.strip().upper()
+    if code in _JOB_CONFIGS:
+        return _JOB_CONFIGS[code]
+    # Unknown job → default all-on config
+    return RuleConfig(job_code=code, _flags={})
+
+
+def list_all_configs() -> Dict[str, Dict[str, bool]]:
+    """Return a human-readable dict of all job configs (for reporting / debugging)."""
+    return {jc: cfg.as_dict() for jc, cfg in sorted(_JOB_CONFIGS.items())}
