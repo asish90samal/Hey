@@ -1,0 +1,506 @@
+"""
+cli/screen_targeted.py
+══════════════════════════════════════════════════════════════════════
+Screen a name against ONE specific watchlist dataset using a single
+InvertedIndex (not MultiDatasetIndex).
+
+If no --watchlist is given, defaults to OFAC_SDN / INDIVIDUAL
+(the most important SAN_IND dataset).
+
+Usage
+─────
+  # Screen against OFAC_SDN (default)
+  python -m cli.screen_targeted --name "Mohammed Ali Hassan"
+
+  # Screen against a specific watchlist
+  python -m cli.screen_targeted --name "Mohammed Ali Hassan" --watchlist OFAC_SDN
+  python -m cli.screen_targeted --name "Ali Khan" --watchlist PEP_DATABASE
+  python -m cli.screen_targeted --name "Tehran Steel" --watchlist UN_CONSOLIDATED --entity-type ENTITY
+
+  # Screen multiple names against one watchlist
+  python -m cli.screen_targeted --names "Ali Hassan, John Smith, Alexei Volkov" --watchlist WORLD_CHECK
+
+  # See all available watchlists
+  python -m cli.screen_targeted --list-watchlists
+
+  # Full options
+  python -m cli.screen_targeted --name "Ali Hassan" --watchlist OFAC_SDN \\
+      --entity-type INDIVIDUAL --country IRAN --dob 1970-03-15 --threshold 0.60
+
+Available watchlists
+────────────────────
+  INDIVIDUAL datasets:
+    OFAC_SDN, UN_CONSOLIDATED, EU_SANCTIONS, HM_TREASURY,
+    INTERPOL_RED, WORLD_CHECK, DOW_JONES, COMPLY_ADVANTAGE, ACCUITY_FIRCO,
+    SCION, PEP_DATABASE, NNS_ARTICLES, NNS_STRUCTURED
+
+  ENTITY datasets (use --entity-type ENTITY):
+    OFAC_SDN, UN_CONSOLIDATED, EU_SANCTIONS, HM_TREASURY,
+    WORLD_CHECK, DOW_JONES, COMPLY_ADVANTAGE, ACCUITY_FIRCO,
+    SCION, PEP_DATABASE, NNS_ARTICLES, NNS_STRUCTURED
+══════════════════════════════════════════════════════════════════════
+"""
+from __future__ import annotations
+import argparse, os, sys, time
+import pandas as pd
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+# ── Display helpers ────────────────────────────────────────────────────────
+W     = 55
+BOLD  = "\033[1m";  GRAY  = "\033[90m"; RESET = "\033[0m"
+RED   = "\033[91m"; YEL   = "\033[93m"; GRN   = "\033[92m"; CYN   = "\033[96m"
+
+def _p(s, w=W):  return str(s)[:w].ljust(w)
+def _row(l, r=None):
+    if r is None:
+        print(f"  {_p(l)}")
+    else:
+        print(f"  {_p(l)} | {_p(r)}")
+def _div(c="-"): print(f"  {c * W}")
+def _col(s, c):  return f"{c}{s}{RESET}"
+def _bar(v, w=18): n = int(round(v * w)); return "█" * n + "░" * (w - n)
+def _dec(d, score):
+    c = RED if d == "ALERT" else YEL if d == "REVIEW" else GRN
+    return _col(f"{d}  ({score:.4f})", c)
+
+_RULE_LABELS = {
+    "I010O": "Exact match",       "I020O": "Fuzzy composite",
+    "I030O": "Token reversed",    "I040O": "Given/family split",
+    "I050O": "Abbreviated",       "I060O": "Phonetic",
+    "I070O": "Transliteration",   "I080O": "DOB cluster",
+}
+
+# ── Dataset → job code mapping ─────────────────────────────────────────────
+# Each dataset belongs to a job type — determines which rule chain and
+# threshold to use when screening against it.
+_DATASET_JOB_MAP: dict[str, str] = {
+    # SAN_IND datasets
+    "OFAC_SDN":         "SAN",
+    "UN_CONSOLIDATED":  "SAN",
+    "EU_SANCTIONS":     "SAN",
+    "HM_TREASURY":      "SAN",
+    "INTERPOL_RED":     "SAN",
+    "WORLD_CHECK":      "SAN",
+    "DOW_JONES":        "SAN",
+    "COMPLY_ADVANTAGE": "SAN",
+    "ACCUITY_FIRCO":    "SAN",
+    # SCION
+    "SCION":            "SCION",
+    # PEP
+    "PEP_DATABASE":     "PEP",
+    # NNS
+    "NNS_ARTICLES":     "NNS",
+    "NNS_STRUCTURED":   "NNS",
+}
+
+# ── Infrastructure ─────────────────────────────────────────────────────────
+
+def build_single_index(watchlist: str, entity_type: str, verbose: bool = True):
+    """
+    Load ONLY the specified watchlist dataset and build a single InvertedIndex.
+
+    Returns (registry, index, df) where:
+      registry  — DatasetRegistry (needed for rule_engine context)
+      index     — InvertedIndex built from the single dataset partition
+      df        — The raw DataFrame for that partition
+    """
+    from data_layer.registry.dataset_registry import DatasetRegistry
+    from blocking_engine.inverted_index import InvertedIndex
+    from matching_engine.rules.base_rule import MatchingRuleEngine
+
+    if verbose:
+        print(f"\n{'='*55}")
+        print(f"  AML TARGETED SCREENER")
+        print(f"  Watchlist : {watchlist}")
+        print(f"  Entity    : {entity_type}")
+        print(f"{'='*55}")
+
+    # 1. Load all data (needed by rule_engine for RuleChain config)
+    if verbose:
+        print("  Loading registry ...", end=" ", flush=True)
+    t = time.perf_counter()
+    registry = DatasetRegistry()
+    registry.load_all(verbose=False, use_saved=True)
+    if verbose:
+        print(f"done  {(time.perf_counter()-t)*1000:.0f} ms")
+
+    # 2. Pull the single partition we care about
+    df = registry.get(watchlist, entity_type=entity_type)
+    if df.empty:
+        print(f"\n  [ERROR] No data found for watchlist='{watchlist}' "
+              f"entity_type='{entity_type}'")
+        print(f"  Run --list-watchlists to see available options.\n")
+        sys.exit(1)
+
+    if verbose:
+        print(f"  Partition  : {len(df):,} records  ({watchlist} / {entity_type})")
+
+    # 3. Build a single InvertedIndex on just that partition
+    if verbose:
+        print("  Building InvertedIndex ...", end=" ", flush=True)
+    t = time.perf_counter()
+    index = InvertedIndex()
+    index.build(df, verbose=False)
+    if verbose:
+        stats = index.stats()
+        print(f"done  {stats['token_keys']:,} tokens  "
+              f"{stats['id_keys']:,} IDs  "
+              f"{(time.perf_counter()-t)*1000:.0f} ms")
+
+    # 4. Rule engine — uses the full registry for rule configuration
+    rule_engine = MatchingRuleEngine(use_llm=False)
+
+    if verbose:
+        print(f"{'='*55}\n")
+
+    return registry, index, df, rule_engine
+
+
+def screen_one_targeted(
+    name: str,
+    watchlist: str,
+    entity_type: str,
+    country: str,
+    dob: str,
+    id_number: str,
+    threshold: float | None,
+    index,         # InvertedIndex
+    rule_engine,   # MatchingRuleEngine
+    max_cands: int = 200,
+) -> dict:
+    """
+    Screen one name against the single InvertedIndex and return results.
+
+    Steps:
+      1. query_with_id() on the InvertedIndex  → candidates DataFrame
+      2. rule_engine.apply() on each candidate → RuleResult per row
+      3. Pick best hit, apply threshold, return structured result dict
+    """
+    from etl_layer.normalization import normalize_name
+    from policy_engine.thresholds import apply_threshold
+    from scoring.consolidator import consolidate
+
+    # Determine job code from watchlist
+    job_prefix = _DATASET_JOB_MAP.get(watchlist.upper(), "SAN")
+    job_code   = f"{job_prefix}_{'IND' if entity_type == 'INDIVIDUAL' else 'ENT'}"
+
+    inp_dict = {
+        "name":        normalize_name(name),
+        "entity_type": entity_type,
+        "dob":         dob,
+        "country":     country,
+        "id_number":   id_number,
+    }
+    norm_name = inp_dict["name"]
+
+    t0 = time.perf_counter()
+
+    # ── Step 1: candidate retrieval via InvertedIndex ──────────────────────
+    identifier = id_number.strip().upper() if id_number else None
+    candidates, exact_id_hit = index.query_with_id(
+        name=norm_name,
+        identifier=identifier,
+        use_phonetic=True,
+    )
+
+    # ── Step 2: apply rule chain to every candidate ────────────────────────
+    all_results = []
+    if not candidates.empty:
+        for _, row in candidates.head(max_cands).iterrows():
+            result = rule_engine.apply(
+                inp_dict, row, job_code, watchlist.upper(), exact_id_hit
+            )
+            all_results.append(result)
+
+    # ── Step 3: consolidate → single score → threshold ────────────────────
+    score_threshold = 0.30   # minimum score to count as a hit
+    cr = consolidate(norm_name, entity_type, job_code, all_results, score_threshold)
+
+    # Apply override threshold if provided, else use job default
+    if threshold is not None:
+        from policy_engine.thresholds import AlertDecision
+        score = cr.consolidated_score
+        review_band = 0.08
+        if score >= threshold:
+            decision = "ALERT"
+        elif score >= threshold - review_band:
+            decision = "REVIEW"
+        else:
+            decision = "NO_ALERT"
+    else:
+        decision = cr.decision.decision
+
+    latency = (time.perf_counter() - t0) * 1000
+
+    return {
+        "input_name":   norm_name,
+        "watchlist":    watchlist.upper(),
+        "entity_type":  entity_type,
+        "job_code":     job_code,
+        "country":      country or "N/A",
+        "dob":          dob or "N/A",
+        "n_candidates": len(candidates),
+        "n_hits":       len(cr.hits),
+        "score":        cr.consolidated_score,
+        "decision":     decision,
+        "top_hit":      cr.top_hit,
+        "all_hits":     cr.hits,
+        "exact_id_hit": exact_id_hit,
+        "latency_ms":   latency,
+    }
+
+
+def print_result(r: dict, num: int, total: int):
+    """Print a clean single-column result for one screened person."""
+    bar = "=" * (W + 4)
+    print(f"\n{bar}")
+    print(f"  PERSON {num}/{total}  ──  {r['input_name']}")
+    print(bar)
+
+    _row(f"  Watchlist   : {_col(r['watchlist'], CYN)}")
+    _row(f"  Entity type : {r['entity_type']}")
+    _row(f"  Job code    : {r['job_code']}")
+    _row(f"  Country     : {r['country']}")
+    _row(f"  DOB         : {r['dob']}")
+    _div(".")
+
+    _row(f"  Candidates retrieved : {r['n_candidates']}")
+    _row(f"  Hits (score ≥ 0.30)  : {r['n_hits']}")
+
+    if r['exact_id_hit']:
+        print(_col("  [!] EXACT ID MATCH — auto-alert", RED))
+
+    top = r['top_hit']
+    if top:
+        _div(".")
+        _row(f"  Top match   : {_col(top.primary_name, BOLD)}")
+        if top.matched_name != top.primary_name:
+            _row(f"  Matched on  : {top.matched_name}  (alias)")
+        _row(f"  Rule fired  : {top.rule_code}  {_RULE_LABELS.get(top.rule_code, '')}")
+        _row(f"  Name score  : {top.name_score:.4f}  {_bar(top.name_score)}")
+
+        # Show all rule scores if available
+        if top.all_rule_scores:
+            _div(".")
+            print(f"  {'Rule':<8} {'Label':<24} {'Score':>6}  {'Bar'}")
+            for code, score in sorted(
+                top.all_rule_scores.items(),
+                key=lambda x: -x[1]
+            ):
+                if score > 0:
+                    winner = " ◄" if code == top.rule_code else ""
+                    label  = _RULE_LABELS.get(code, "")
+                    print(f"  {code:<8} {label:<24} {score:>6.3f}  "
+                          f"[{_bar(score, 16)}]{winner}")
+
+        # Show top 5 hits if multiple
+        if len(r['all_hits']) > 1:
+            _div(".")
+            print(f"  Top matches:")
+            for h in sorted(r['all_hits'], key=lambda x: -x.rule_score)[:5]:
+                dec_col = RED if h.auto_alert else YEL if h.review_flag else GRAY
+                print(f"    {_col(f'{h.rule_score:.3f}', dec_col)}  "
+                      f"{h.primary_name[:38]:<38}  "
+                      f"{h.rule_code}")
+    else:
+        _div(".")
+        print(_col("  No matches found above threshold.", GRAY))
+
+    _div("-")
+    _row(f"  FINAL SCORE : {r['score']:.4f}  [{_bar(r['score'])}]")
+    _div("-")
+    print(f"  DECISION    : {_dec(r['decision'], r['score'])}")
+    _row(f"  Latency     : {r['latency_ms']:.1f} ms")
+
+
+def print_batch_summary(results: list[dict]):
+    """Print a compact summary table for multiple names."""
+    bar = "=" * 90
+    print(f"\n{bar}")
+    print("  BATCH SUMMARY")
+    print(bar)
+    print(f"  {'#':<3} {'Name':<30} {'Watchlist':<18} {'Score':>7}  {'Decision':<12} {'Hits':>5}")
+    print(f"  {'-'*85}")
+    for i, r in enumerate(results, 1):
+        c = RED if r['decision'] == "ALERT" else YEL if r['decision'] == "REVIEW" else GRN
+        print(f"  {i:<3} {r['input_name'][:30]:<30} {r['watchlist']:<18} "
+              f"{r['score']:>7.4f}  {_col(r['decision'], c):<10}  {r['n_hits']:>5}")
+    print()
+    n = len(results)
+    alerts  = sum(1 for r in results if r['decision'] == "ALERT")
+    reviews = sum(1 for r in results if r['decision'] == "REVIEW")
+    print(f"  Screened : {n}  |  ALERTS: {alerts}  |  REVIEWS: {reviews}  |  "
+          f"CLEAR: {n - alerts - reviews}")
+    print(bar)
+
+
+def list_watchlists(registry):
+    """Print all available watchlist partitions."""
+    print(f"\n{'='*55}")
+    print(f"  Available watchlists")
+    print(f"{'='*55}")
+    print(f"  {'Dataset':<25} {'Entity Type':<14} {'Records':>8}")
+    print(f"  {'-'*50}")
+    for code, etype, count in registry.list_partitions():
+        print(f"  {code:<25} {etype:<14} {count:>8,}")
+    print(f"{'='*55}")
+    print(f"\n  Usage example:")
+    print(f"    python -m cli.screen_targeted --name \"Ali Hassan\" --watchlist OFAC_SDN")
+    print(f"    python -m cli.screen_targeted --name \"Tehran Co\" "
+          f"--watchlist UN_CONSOLIDATED --entity-type ENTITY\n")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AML Targeted Screener — screen against one specific watchlist",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    grp = parser.add_mutually_exclusive_group()
+    grp.add_argument("--name",  help="Single name to screen")
+    grp.add_argument("--names", help="Comma-separated names")
+    grp.add_argument("--csv",   help="CSV file (columns: name, watchlist, entity_type, "
+                                     "country, dob)")
+
+    parser.add_argument("--watchlist",   default="OFAC_SDN",
+                        help="Watchlist dataset to screen against "
+                             "(default: OFAC_SDN). Use --list-watchlists to see all.")
+    parser.add_argument("--entity-type", default="INDIVIDUAL",
+                        dest="entity_type",
+                        help="INDIVIDUAL (default) or ENTITY")
+    parser.add_argument("--country",     default="")
+    parser.add_argument("--dob",         default="")
+    parser.add_argument("--id-number",   default="", dest="id_number")
+    parser.add_argument("--threshold",   default=None, type=float,
+                        help="Override alert threshold (0.0–1.0). "
+                             "Default: use job-specific threshold.")
+    parser.add_argument("--max-hits",    default=5, type=int, dest="max_hits",
+                        help="Max top hits to display (default: 5)")
+    parser.add_argument("--list-watchlists", action="store_true",
+                        dest="list_watchlists",
+                        help="Print all available watchlists and exit")
+    parser.add_argument("--quiet", action="store_true")
+
+    args = parser.parse_args()
+
+    # ── --list-watchlists: just load registry and print, then exit ──────────
+    if args.list_watchlists:
+        from data_layer.registry.dataset_registry import DatasetRegistry
+        registry = DatasetRegistry().load_all(verbose=False)
+        list_watchlists(registry)
+        sys.exit(0)
+
+    # ── Require at least one name source ────────────────────────────────────
+    if not args.name and not args.names and not args.csv:
+        # Default behaviour: no name given → tell the user what to do
+        print("\n  No name provided.")
+        print("  Defaulting to: --watchlist OFAC_SDN --entity-type INDIVIDUAL")
+        print("  Please provide a name to screen:\n")
+        print("    python -m cli.screen_targeted --name \"Your Name Here\"")
+        print("    python -m cli.screen_targeted --name \"Your Name\" "
+              "--watchlist PEP_DATABASE\n")
+        print("  Use --list-watchlists to see all available datasets.\n")
+        parser.print_help()
+        sys.exit(0)
+
+    entity_type = args.entity_type.strip().upper()
+    watchlist   = args.watchlist.strip().upper()
+
+    # ── Build single InvertedIndex for the requested watchlist ────────────
+    registry, index, df, rule_engine = build_single_index(
+        watchlist=watchlist,
+        entity_type=entity_type,
+        verbose=not args.quiet,
+    )
+
+    # ── Build persons list ────────────────────────────────────────────────
+    persons = []
+
+    if args.name:
+        persons.append({
+            "name":        args.name,
+            "watchlist":   watchlist,
+            "entity_type": entity_type,
+            "country":     args.country,
+            "dob":         args.dob,
+            "id_number":   args.id_number,
+        })
+
+    elif args.names:
+        for n in args.names.split(","):
+            n = n.strip()
+            if n:
+                persons.append({
+                    "name":        n,
+                    "watchlist":   watchlist,
+                    "entity_type": entity_type,
+                    "country":     args.country,
+                    "dob":         args.dob,
+                    "id_number":   "",
+                })
+
+    elif args.csv:
+        if not os.path.isfile(args.csv):
+            print(f"ERROR: CSV not found: {args.csv}")
+            sys.exit(1)
+        df_in = pd.read_csv(args.csv)
+        df_in.columns = [c.lower().strip() for c in df_in.columns]
+        for _, row in df_in.iterrows():
+            persons.append({
+                "name":        str(row.get("name", "")),
+                "watchlist":   str(row.get("watchlist",   watchlist)).upper(),
+                "entity_type": str(row.get("entity_type", entity_type)).upper(),
+                "country":     str(row.get("country",     args.country)),
+                "dob":         str(row.get("dob",         args.dob)),
+                "id_number":   str(row.get("id_number",   "")),
+            })
+        if not args.quiet:
+            print(f"  Loaded {len(persons)} persons from {args.csv}\n")
+
+    if not persons:
+        print("No persons to screen.")
+        sys.exit(0)
+
+    # ── Screen each person ────────────────────────────────────────────────
+    results = []
+    for i, p in enumerate(persons, 1):
+
+        # If CSV has different watchlists per row, rebuild index for that watchlist
+        # (only rebuild if it changed)
+        if p["watchlist"] != watchlist or p["entity_type"] != entity_type:
+            watchlist   = p["watchlist"]
+            entity_type = p["entity_type"]
+            if not args.quiet:
+                print(f"\n  [Switching to {watchlist} / {entity_type}]")
+            _, index, _, rule_engine = build_single_index(
+                watchlist=watchlist,
+                entity_type=entity_type,
+                verbose=not args.quiet,
+            )
+
+        r = screen_one_targeted(
+            name=        p["name"],
+            watchlist=   p["watchlist"],
+            entity_type= p["entity_type"],
+            country=     p["country"],
+            dob=         p["dob"],
+            id_number=   p["id_number"],
+            threshold=   args.threshold,
+            index=       index,
+            rule_engine= rule_engine,
+        )
+        print_result(r, i, len(persons))
+        results.append(r)
+
+    if len(results) > 1:
+        print_batch_summary(results)
+
+
+if __name__ == "__main__":
+    main()
