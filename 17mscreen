@@ -487,4 +487,158 @@ def main():
     parser.add_argument("--country",     default="")
     parser.add_argument("--dob",         default="")
     parser.add_argument("--entity-type", default="INDIVIDUAL", dest="entity_type")
-    parser.add
+    parser.add_argument("--job",         default="SAN",
+                        help="SAN | PEP | SCION | NNS | CTRY")
+    parser.add_argument("--id-number",   default="", dest="id_number")
+    parser.add_argument("--gender",      default="",
+                        help="M | F | UNKNOWN  (used for I110O gender corroboration)")
+
+    # ── OWS-style rule profile arguments ──────────────────────────────────
+    rule_grp = parser.add_mutually_exclusive_group()
+    rule_grp.add_argument(
+        "--rules",
+        default="",
+        metavar="I010O,I020O,...",
+        help=(
+            "Run ONLY these comma-separated rule codes and disable all others. "
+            "e.g. --rules I010O,I020O,I080O  "
+            "Equivalent to an OWS run profile with explicit rule whitelist."
+        ),
+    )
+    rule_grp.add_argument(
+        "--rules-off",
+        default="",
+        dest="rules_off",
+        metavar="I060O,I070O,...",
+        help="Disable specific rules on top of job defaults. e.g. --rules-off I060O,I070O",
+    )
+    rule_grp.add_argument(
+        "--rules-on",
+        default="",
+        dest="rules_on",
+        metavar="I060O,...",
+        help="Force specific rules ON even if the job config has them off. e.g. --rules-on I060O",
+    )
+
+    parser.add_argument(
+        "--list-rules",
+        action="store_true",
+        dest="list_rules",
+        help="Show all 8 OWS rule codes with descriptions and exit.",
+    )
+
+    parser.add_argument("--model-report", action="store_true")
+    parser.add_argument("--quiet",        action="store_true")
+    args = parser.parse_args()
+
+    # ── --list-rules: show table and exit ─────────────────────────────────
+    if args.list_rules:
+        from config.rule_config import set_runtime_overrides, get_active_rules
+        # Apply any rules flag so --list-rules --rules I010O,I020O shows what would run
+        if args.rules:
+            codes = [c.strip() for c in args.rules.split(",") if c.strip()]
+            set_runtime_overrides(only=codes)
+        elif args.rules_off:
+            codes = [c.strip() for c in args.rules_off.split(",") if c.strip()]
+            set_runtime_overrides(disable=codes)
+        elif args.rules_on:
+            codes = [c.strip() for c in args.rules_on.split(",") if c.strip()]
+            set_runtime_overrides(enable=codes)
+        _print_rule_list(get_active_rules())
+        sys.exit(0)
+
+    # ── Apply runtime rule overrides before building infrastructure ────────
+    from config.rule_config import set_runtime_overrides, clear_runtime_overrides
+
+    clear_runtime_overrides()   # always start clean
+
+    if args.rules:
+        codes = [c.strip() for c in args.rules.split(",") if c.strip()]
+        try:
+            set_runtime_overrides(only=codes)
+        except ValueError as e:
+            print(f"ERROR: {e}"); sys.exit(1)
+        if not args.quiet:
+            print(f"\n  [Rule profile] Running ONLY: {', '.join(codes)}")
+
+    elif args.rules_off:
+        codes = [c.strip() for c in args.rules_off.split(",") if c.strip()]
+        try:
+            set_runtime_overrides(disable=codes)
+        except ValueError as e:
+            print(f"ERROR: {e}"); sys.exit(1)
+        if not args.quiet:
+            print(f"\n  [Rule profile] Disabled: {', '.join(codes)}")
+
+    elif args.rules_on:
+        codes = [c.strip() for c in args.rules_on.split(",") if c.strip()]
+        try:
+            set_runtime_overrides(enable=codes)
+        except ValueError as e:
+            print(f"ERROR: {e}"); sys.exit(1)
+        if not args.quiet:
+            print(f"\n  [Rule profile] Force-enabled: {', '.join(codes)}")
+
+    orch, model = build_infrastructure(verbose=not args.quiet)
+
+    from orchestration.orchestrator import ScreeningInput
+
+    # Build persons list
+    persons: list[ScreeningInput] = []
+
+    if args.name:
+        persons.append(ScreeningInput(
+            name=args.name, country=args.country, dob=args.dob,
+            entity_type=args.entity_type, job_type=args.job,
+            id_number=args.id_number, gender=args.gender,
+        ))
+
+    elif args.names:
+        for n in args.names.split(","):
+            n = n.strip()
+            if n:
+                persons.append(ScreeningInput(
+                    name=n, country=args.country, dob=args.dob,
+                    entity_type=args.entity_type, job_type=args.job,
+                    gender=args.gender,
+                ))
+
+    elif args.csv:
+        if not os.path.isfile(args.csv):
+            print(f"ERROR: CSV not found: {args.csv}"); sys.exit(1)
+        df_in = pd.read_csv(args.csv)
+        df_in.columns = [c.lower().strip() for c in df_in.columns]
+        for _, row in df_in.iterrows():
+            persons.append(ScreeningInput(
+                name=        str(row.get("name", "")),
+                country=     str(row.get("country",     args.country)),
+                dob=         str(row.get("dob",         args.dob)),
+                entity_type= str(row.get("entity_type", args.entity_type)),
+                job_type=    str(row.get("job_type",    args.job)),
+                id_number=   str(row.get("id_number",   "")),
+                gender=      str(row.get("gender",      args.gender)),
+            ))
+        if not args.quiet:
+            print(f"  Loaded {len(persons)} persons from {args.csv}\n")
+
+    if not persons:
+        print("No persons to screen."); sys.exit(0)
+
+    outputs = []
+    for i, inp in enumerate(persons, 1):
+        out = orch.screen_integrated(inp)
+        print_comparison(out, i, len(persons))
+        outputs.append(out)
+
+    if len(outputs) > 1:
+        print_batch_summary(outputs)
+
+    if args.model_report:
+        print_model_report(model)
+
+    # Clean up so overrides don't persist if the module is reused
+    clear_runtime_overrides()
+
+
+if __name__ == "__main__":
+    main()
