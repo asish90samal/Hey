@@ -1,0 +1,336 @@
+"""
+config/rule_config.py
+══════════════════════
+Per-job rule enable/disable configuration.
+Equivalent to OWS Run Profile properties:
+  phase.*.process.*.[I010O] Exact name only.san_rule_enabled = true/false
+
+Each job code maps to a RuleConfig object whose .enabled(key) method
+tells the RuleChain whether to execute a given atomic rule.
+
+Default policy:
+  • Exact + Fuzzy + Reversed + Given/Family + Abbreviated + Transliteration
+    are ON for all name-match jobs.
+  • Phonetic (I060O) is OFF for SAN/SCION (high false-positive rate on
+    sanction names) but ON for PEP jobs (higher sensitivity acceptable).
+  • DOB cluster (I080O) is ON only for INDIVIDUAL jobs that carry a DOB field.
+  • NNS jobs disable DOB cluster (NNS records don't carry DOB).
+
+Runtime override (OWS-style run profile):
+  from config.rule_config import set_runtime_overrides, clear_runtime_overrides
+
+  # Run with ONLY exact + fuzzy + DOB cluster
+  set_runtime_overrides(only=["I010O", "I020O", "I080O"])
+
+  # Run everything EXCEPT phonetic and transliteration
+  set_runtime_overrides(disable=["I060O", "I070O"])
+
+  # Turn a specific rule on even if the job config has it off
+  set_runtime_overrides(enable=["I060O"])
+
+  # Remove all overrides (back to job defaults)
+  clear_runtime_overrides()
+
+From the CLI:
+  python -m cli.screen --name "Ali Hassan" --rules I010O,I020O,I080O
+  python -m cli.screen --name "Ali Hassan" --rules-off I060O,I070O
+  python -m cli.screen --name "Ali Hassan" --rules-on  I060O
+  python -m cli.screen --name "Ali Hassan" --list-rules
+
+To change flags at runtime per-job:
+    cfg = get_rule_config("SAN_IND")
+    cfg.set("I060O_PHONETIC", True)
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+
+# ── Rule code → config key mapping ────────────────────────────────────────
+# Used by set_runtime_overrides() to translate rule codes to config keys.
+RULE_CODE_TO_KEY: Dict[str, str] = {
+    "I010O": "I010O_EXACT",
+    "I020O": "I020O_FUZZY",
+    "I030O": "I030O_REVERSED",
+    "I040O": "I040O_GIVEN_FAMILY",
+    "I050O": "I050O_ABBREVIATED",
+    "I060O": "I060O_PHONETIC",
+    "I070O": "I070O_TRANSLITERATION",
+    "I080O": "I080O_DOB_CLUSTER",
+}
+
+RULE_KEY_TO_CODE: Dict[str, str] = {v: k for k, v in RULE_CODE_TO_KEY.items()}
+
+# Human labels for display / --list-rules
+RULE_LABELS: Dict[str, str] = {
+    "I010O": "Exact name match",
+    "I020O": "Fuzzy composite match",
+    "I030O": "Reversed token order",
+    "I040O": "Given/family name split match",
+    "I050O": "Abbreviated given name",
+    "I060O": "Phonetic match (Double Metaphone)",
+    "I070O": "Transliteration match",
+    "I080O": "DOB cluster (name + DOB corroboration)",
+}
+
+
+# ── Default ON/OFF for every rule key ─────────────────────────────────────
+_DEFAULTS: Dict[str, bool] = {
+    "I010O_EXACT":           True,
+    "I020O_FUZZY":           True,
+    "I030O_REVERSED":        True,
+    "I040O_GIVEN_FAMILY":    True,
+    "I050O_ABBREVIATED":     True,
+    "I060O_PHONETIC":        False,   # OFF by default — high FP rate
+    "I070O_TRANSLITERATION": True,
+    "I080O_DOB_CLUSTER":     True,
+}
+
+
+# ── Runtime override state (module-level, applied globally) ───────────────
+# Set by set_runtime_overrides(), cleared by clear_runtime_overrides().
+# When populated, get_rule_config() merges these ON TOP of the job config.
+_RUNTIME_FORCE_ONLY:    List[str] | None = None   # explicit whitelist of keys
+_RUNTIME_ENABLE:        Dict[str, bool]  = {}     # keys to force ON
+_RUNTIME_DISABLE:       Dict[str, bool]  = {}     # keys to force OFF
+
+
+def set_runtime_overrides(
+    only:    list[str] | None = None,
+    enable:  list[str] | None = None,
+    disable: list[str] | None = None,
+) -> None:
+    """
+    Set module-level rule overrides that apply to every subsequent screening call.
+
+    Parameters
+    ----------
+    only    : If given, ONLY these rule codes run (everything else is forced OFF).
+              Equivalent to OWS "run profile" with explicit rule whitelist.
+              e.g. only=["I010O", "I020O", "I080O"]
+
+    enable  : Force these rule codes ON regardless of job config.
+              e.g. enable=["I060O"]  — turn phonetic on even for SAN_IND
+
+    disable : Force these rule codes OFF regardless of job config.
+              e.g. disable=["I070O", "I060O"]
+
+    If `only` is given, `enable` and `disable` are ignored.
+    Call clear_runtime_overrides() to reset.
+    """
+    global _RUNTIME_FORCE_ONLY, _RUNTIME_ENABLE, _RUNTIME_DISABLE
+
+    def _to_keys(codes: list[str]) -> list[str]:
+        result = []
+        for c in codes:
+            c = c.strip().upper()
+            if c in RULE_CODE_TO_KEY:
+                result.append(RULE_CODE_TO_KEY[c])
+            elif c in RULE_KEY_TO_CODE:
+                result.append(c)   # already a key
+            else:
+                raise ValueError(
+                    f"Unknown rule code or key: {c!r}\n"
+                    f"Valid codes: {', '.join(sorted(RULE_CODE_TO_KEY))}"
+                )
+        return result
+
+    if only is not None:
+        _RUNTIME_FORCE_ONLY = _to_keys(only)
+        _RUNTIME_ENABLE     = {}
+        _RUNTIME_DISABLE    = {}
+    else:
+        _RUNTIME_FORCE_ONLY = None
+        _RUNTIME_ENABLE  = {k: True  for k in _to_keys(enable  or [])}
+        _RUNTIME_DISABLE = {k: False for k in _to_keys(disable or [])}
+
+
+def clear_runtime_overrides() -> None:
+    """Remove all runtime overrides. Returns to job-specific defaults."""
+    global _RUNTIME_FORCE_ONLY, _RUNTIME_ENABLE, _RUNTIME_DISABLE
+    _RUNTIME_FORCE_ONLY = None
+    _RUNTIME_ENABLE     = {}
+    _RUNTIME_DISABLE    = {}
+
+
+def get_active_rules() -> Dict[str, bool]:
+    """
+    Return a dict showing which rules are currently active under the runtime
+    override (or None if no override is set).  Used by --list-rules display.
+    """
+    if _RUNTIME_FORCE_ONLY is not None:
+        return {k: (k in _RUNTIME_FORCE_ONLY) for k in _DEFAULTS}
+    if _RUNTIME_ENABLE or _RUNTIME_DISABLE:
+        merged = dict(_DEFAULTS)
+        merged.update(_RUNTIME_ENABLE)
+        merged.update(_RUNTIME_DISABLE)
+        return merged
+    return {}   # empty = no override active
+
+
+@dataclass
+class RuleConfig:
+    """
+    Holds rule flags for a single job.  Inherits from defaults; overrides
+    are applied per-job below.
+
+    Runtime overrides (set_runtime_overrides) are merged on top of the
+    job-specific flags each time .enabled() is called.
+    """
+    job_code: str
+    _flags: Dict[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Start from defaults, then apply any job-specific overrides
+        merged = dict(_DEFAULTS)
+        merged.update(self._flags)
+        self._flags = merged
+
+    def enabled(self, key: str) -> bool:
+        """
+        Return True if the rule identified by `key` is enabled.
+
+        Priority (highest first):
+          1. Runtime force-only whitelist (_RUNTIME_FORCE_ONLY)
+          2. Runtime enable/disable overrides (_RUNTIME_ENABLE / _RUNTIME_DISABLE)
+          3. Job-specific flags (self._flags)
+        """
+        # 1. Force-only: only whitelisted rules are enabled
+        if _RUNTIME_FORCE_ONLY is not None:
+            return key in _RUNTIME_FORCE_ONLY
+
+        # 2. Runtime enable/disable
+        if key in _RUNTIME_ENABLE:
+            return True
+        if key in _RUNTIME_DISABLE:
+            return False
+
+        # 3. Job default
+        return self._flags.get(key, True)
+
+    def set(self, key: str, value: bool) -> None:
+        """Override a rule flag at runtime (e.g. for A/B testing)."""
+        self._flags[key] = value
+
+    def as_dict(self) -> Dict[str, bool]:
+        """Return the effective flags including runtime overrides."""
+        merged = dict(self._flags)
+        if _RUNTIME_FORCE_ONLY is not None:
+            return {k: (k in _RUNTIME_FORCE_ONLY) for k in merged}
+        merged.update(_RUNTIME_ENABLE)
+        merged.update(_RUNTIME_DISABLE)
+        return merged
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Per-job configurations
+# ══════════════════════════════════════════════════════════════════════════════
+
+_JOB_CONFIGS: Dict[str, RuleConfig] = {
+
+    # ── SAN_IND ───────────────────────────────────────────────────────────
+    # Sanctions Individual: strict name + DOB, phonetic OFF (high FP)
+    "SAN_IND": RuleConfig(
+        job_code="SAN_IND",
+        _flags={
+            "I060O_PHONETIC":     False,
+            "I080O_DOB_CLUSTER":  True,
+        },
+    ),
+
+    # ── SAN_ENT ───────────────────────────────────────────────────────────
+    # Sanctions Entity: no DOB (entities don't have DOB), phonetic OFF
+    "SAN_ENT": RuleConfig(
+        job_code="SAN_ENT",
+        _flags={
+            "I060O_PHONETIC":     False,
+            "I080O_DOB_CLUSTER":  False,   # entities have no DOB
+        },
+    ),
+
+    # ── SCION_IND ─────────────────────────────────────────────────────────
+    # Internal watchlist individual: all standard rules, phonetic OFF
+    "SCION_IND": RuleConfig(
+        job_code="SCION_IND",
+        _flags={
+            "I060O_PHONETIC":     False,
+            "I080O_DOB_CLUSTER":  True,
+        },
+    ),
+
+    # ── SCION_ENT ─────────────────────────────────────────────────────────
+    "SCION_ENT": RuleConfig(
+        job_code="SCION_ENT",
+        _flags={
+            "I060O_PHONETIC":     False,
+            "I080O_DOB_CLUSTER":  False,
+        },
+    ),
+
+    # ── PEP_IND ───────────────────────────────────────────────────────────
+    # PEP Individual: phonetic ON (higher sensitivity acceptable for PEP),
+    # DOB cluster ON
+    "PEP_IND": RuleConfig(
+        job_code="PEP_IND",
+        _flags={
+            "I060O_PHONETIC":     True,    # PEP jobs can afford higher sensitivity
+            "I080O_DOB_CLUSTER":  True,
+        },
+    ),
+
+    # ── PEP_ENT ───────────────────────────────────────────────────────────
+    "PEP_ENT": RuleConfig(
+        job_code="PEP_ENT",
+        _flags={
+            "I060O_PHONETIC":     True,
+            "I080O_DOB_CLUSTER":  False,   # entities have no DOB
+        },
+    ),
+
+    # ── NNS_IND ───────────────────────────────────────────────────────────
+    # Negative News Individual: phonetic ON, DOB cluster OFF (NNS lacks DOB)
+    "NNS_IND": RuleConfig(
+        job_code="NNS_IND",
+        _flags={
+            "I060O_PHONETIC":     True,
+            "I080O_DOB_CLUSTER":  False,   # NNS records don't carry DOB
+        },
+    ),
+
+    # ── NNS_ENT ───────────────────────────────────────────────────────────
+    "NNS_ENT": RuleConfig(
+        job_code="NNS_ENT",
+        _flags={
+            "I060O_PHONETIC":     True,
+            "I080O_DOB_CLUSTER":  False,
+        },
+    ),
+
+    # ── CTRY jobs ─────────────────────────────────────────────────────────
+    # Country jobs don't use name matching — all rules OFF
+    "CTRY_IND": RuleConfig(
+        job_code="CTRY_IND",
+        _flags={k: False for k in _DEFAULTS},
+    ),
+    "CTRY_ENT": RuleConfig(
+        job_code="CTRY_ENT",
+        _flags={k: False for k in _DEFAULTS},
+    ),
+}
+
+
+def get_rule_config(job_code: str) -> RuleConfig:
+    """
+    Return the RuleConfig for the given job_code.
+    Falls back to the default config (all defaults) for unknown job codes.
+    """
+    code = job_code.strip().upper()
+    if code in _JOB_CONFIGS:
+        return _JOB_CONFIGS[code]
+    # Unknown job → default all-on config
+    return RuleConfig(job_code=code, _flags={})
+
+
+def list_all_configs() -> Dict[str, Dict[str, bool]]:
+    """Return a human-readable dict of all job configs (for reporting / debugging)."""
+    return {jc: cfg.as_dict() for jc, cfg in sorted(_JOB_CONFIGS.items())}
